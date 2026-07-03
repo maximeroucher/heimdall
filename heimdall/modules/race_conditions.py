@@ -28,6 +28,7 @@ _ONCE_HINTS = (
     "use", "consume", "withdraw", "transfer", "cashout", "payout", "refund",
     "like", "follow", "join", "enroll", "submit", "confirm", "activate", "accept",
     "spend", "debit", "topup", "recharge", "enter", "signup",
+    "scan", "validate", "ticket", "check-in", "checkin", "collect",
 )
 _BURST = 20
 
