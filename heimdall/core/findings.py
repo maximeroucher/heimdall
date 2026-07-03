@@ -10,7 +10,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 
-from .taxonomy import OWASP_2021, SEVERITIES
+from .taxonomy import CVSS_BAND, OWASP_2021, SEVERITIES
 
 _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "SAFE": 5}
 _SEV_BADGE = {
@@ -39,7 +39,7 @@ class Finding:
             raise ValueError(f"bad owasp id: {self.owasp}")
 
 
-def write_reports(findings: list[Finding], out_dir: str, meta: dict) -> tuple[str, str]:
+def write_reports(findings: list[Finding], out_dir: str, meta: dict) -> tuple[str, str, str]:
     os.makedirs(out_dir, exist_ok=True)
     json_path = os.path.join(out_dir, "findings.json")
     with open(json_path, "w") as fh:
@@ -47,7 +47,10 @@ def write_reports(findings: list[Finding], out_dir: str, meta: dict) -> tuple[st
     md_path = os.path.join(out_dir, "REPORT.md")
     with open(md_path, "w") as fh:
         fh.write(_render_md(findings, meta))
-    return json_path, md_path
+    html_path = os.path.join(out_dir, "REPORT.html")
+    with open(html_path, "w") as fh:
+        fh.write(_render_html(findings, meta))
+    return json_path, md_path, html_path
 
 
 def _render_md(findings: list[Finding], meta: dict) -> str:
@@ -91,18 +94,22 @@ def _render_md(findings: list[Finding], meta: dict) -> str:
         L.append("---\n")
 
     L.append("### Findings at a glance\n")
-    L.append("| # | Severity | OWASP | Finding |")
-    L.append("|---|---|---|---|")
+    L.append("| # | Severity | CVSS* | OWASP | Finding |")
+    L.append("|---|---|---|---|---|")
     ordered = sorted(findings, key=lambda f: (_SEV_ORDER[f.severity], f.owasp))
     for i, f in enumerate(ordered, 1):
-        L.append(f"| {i} | {_SEV_BADGE[f.severity]} | {f.owasp} | {f.title} |")
-    L.append("")
+        L.append(f"| {i} | {_SEV_BADGE[f.severity]} | {CVSS_BAND[f.severity]} | "
+                 f"{f.owasp} | {f.title} |")
+    L.append("\n<sub>*CVSS is an indicative severity-band score, not a per-finding "
+             "computed vector.</sub>\n")
 
     L.append("---\n")
     L.append("## Detailed findings\n")
     for i, f in enumerate(ordered, 1):
         L.append(f"### {i}. [{f.severity}] {f.title}")
         L.append(f"- **OWASP:** {OWASP_2021[f.owasp]}")
+        if f.severity != "SAFE":
+            L.append(f"- **Severity:** {f.severity} (indicative CVSS {CVSS_BAND[f.severity]})")
         L.append(f"- **ID:** `{f.id}`" + (f" · **module:** `{f.module}`" if f.module else "") + "\n")
         L.append(f"{f.summary}\n")
         if f.evidence:
@@ -123,3 +130,106 @@ def _render_md(findings: list[Finding], meta: dict) -> str:
             L.append(f"- {n}")
         L.append("")
     return "\n".join(L)
+
+
+# ── HTML report ───────────────────────────────────────────────────────────────
+
+_HTML_SEV_COLOR = {
+    "CRITICAL": "#b30000", "HIGH": "#e8590c", "MEDIUM": "#c9a000",
+    "LOW": "#1971c2", "INFO": "#868e96", "SAFE": "#2b8a3e",
+}
+
+
+def _esc(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _badge(sev: str) -> str:
+    return (f'<span style="background:{_HTML_SEV_COLOR[sev]};color:#fff;padding:2px 8px;'
+            f'border-radius:4px;font-size:12px;font-weight:600">{sev}</span>')
+
+
+def _render_html(findings: list[Finding], meta: dict) -> str:
+    from .chains import build_chains
+    real = [f for f in findings if f.severity != "SAFE"]
+    counts = {s: sum(1 for f in real if f.severity == s) for s in SEVERITIES if s != "SAFE"}
+    ordered = sorted(findings, key=lambda f: (_SEV_ORDER[f.severity], f.owasp))
+    app = _esc(meta.get("app_name", "target"))
+
+    H = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
+         f"<title>{app} — Heimdall report</title>",
+         "<style>",
+         "body{font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;max-width:960px;"
+         "margin:2rem auto;padding:0 1rem;color:#212529}",
+         "h1{border-bottom:3px solid #212529;padding-bottom:.3rem}",
+         "h3{margin-top:2rem;border-left:4px solid #adb5bd;padding-left:.6rem}",
+         "table{border-collapse:collapse;width:100%;margin:1rem 0}",
+         "th,td{border:1px solid #dee2e6;padding:6px 10px;text-align:left;font-size:14px}",
+         "th{background:#f1f3f5}",
+         "pre{background:#f8f9fa;border:1px solid #e9ecef;padding:.8rem;overflow:auto;"
+         "border-radius:6px;font-size:13px}",
+         "code{background:#f1f3f5;padding:1px 4px;border-radius:3px}",
+         ".chain{background:#fff4e6;border:1px solid #ffd8a8;border-radius:8px;"
+         "padding:.4rem 1rem;margin:1rem 0}",
+         ".meta{color:#495057;font-size:14px}",
+         "</style></head><body>"]
+
+    H.append(f"<h1>{app} — Web Application Penetration Test</h1>")
+    H.append('<p class="meta">'
+             f"Target: <code>{_esc(meta.get('base_url'))}</code> · "
+             f"Date: {_esc(meta.get('date'))} · "
+             f"Framework: {_esc(meta.get('framework','FastAPI'))} · "
+             f"Mode: {'SAFE' if meta.get('safe') else 'FULL'} · "
+             f"Routes: {meta.get('route_count','?')}</p>")
+    H.append("<p><em>Automated assessment generated by Heimdall. Run only against systems "
+             "you own or are explicitly authorized to test.</em></p>")
+
+    H.append("<h2>Executive summary</h2><table><tr><th>Severity</th><th>Indicative CVSS</th>"
+             "<th>Count</th></tr>")
+    from .taxonomy import CVSS_BAND
+    for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
+        H.append(f"<tr><td>{_badge(s)}</td><td>{CVSS_BAND[s]}</td><td>{counts.get(s,0)}</td></tr>")
+    H.append(f"<tr><td>{_badge('SAFE')}</td><td>—</td>"
+             f"<td>{sum(1 for f in findings if f.severity=='SAFE')}</td></tr></table>")
+
+    chains = build_chains(findings)
+    if chains:
+        H.append("<h2>Attack chains</h2>")
+        for i, c in enumerate(chains, 1):
+            H.append(f'<div class="chain"><b>⛓️ {i}. {_badge(c.severity)} {_esc(c.title)}</b><ol>')
+            for step in c.steps:
+                H.append(f"<li>{_esc(step)}</li>")
+            H.append("</ol>")
+            if c.finding_ids:
+                H.append('<p class="meta">Chained: '
+                         + ", ".join(f"<code>{_esc(x)}</code>" for x in c.finding_ids) + "</p>")
+            H.append("</div>")
+
+    H.append("<h2>Findings</h2><table><tr><th>#</th><th>Severity</th><th>CVSS</th>"
+             "<th>OWASP</th><th>Finding</th></tr>")
+    for i, f in enumerate(ordered, 1):
+        H.append(f"<tr><td>{i}</td><td>{_badge(f.severity)}</td><td>{CVSS_BAND[f.severity]}</td>"
+                 f"<td>{f.owasp}</td><td>{_esc(f.title)}</td></tr>")
+    H.append("</table>")
+
+    for i, f in enumerate(ordered, 1):
+        H.append(f"<h3>{i}. {_badge(f.severity)} {_esc(f.title)}</h3>")
+        H.append(f'<p class="meta">{_esc(OWASP_2021[f.owasp])} · <code>{_esc(f.id)}</code>'
+                 + (f" · module <code>{_esc(f.module)}</code>" if f.module else "")
+                 + (f" · indicative CVSS {CVSS_BAND[f.severity]}" if f.severity != "SAFE" else "")
+                 + "</p>")
+        H.append(f"<p>{_esc(f.summary)}</p>")
+        if f.evidence:
+            H.append(f"<b>Evidence / PoC</b><pre>{_esc(f.evidence.strip())}</pre>")
+        if f.reproduction:
+            H.append(f"<b>Reproduction</b><pre>{_esc(f.reproduction.strip())}</pre>")
+        if f.references:
+            H.append("<p><b>References:</b> "
+                     + " · ".join(f'<a href="{_esc(r)}">{_esc(r)}</a>' for r in f.references)
+                     + "</p>")
+        if f.tools:
+            H.append(f"<p><b>Tools:</b> {_esc(', '.join(f.tools))}</p>")
+
+    H.append("</body></html>")
+    return "\n".join(H)

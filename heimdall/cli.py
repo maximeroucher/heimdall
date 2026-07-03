@@ -125,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
     for f in sorted(result.issues, key=lambda x: x.severity):
         print(f"    {f.severity:9} {f.owasp}  {f.title}")
     print(f"\n[=] Report:  {result.report_paths[1]}")
+    if len(result.report_paths) > 2:
+        print(f"[=] HTML:    {result.report_paths[2]}")
     print(f"[=] JSON:    {result.report_paths[0]}")
     # exit non-zero if anything HIGH/CRITICAL, handy for CI gating
     bad = [f for f in result.issues if f.severity in ("HIGH", "CRITICAL")]

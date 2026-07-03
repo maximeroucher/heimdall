@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 SEVERITIES = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL", "SAFE"]
+
+# Indicative CVSS 3.1 base score per severity band (severity-derived, not a
+# per-finding computed vector — a quick at-a-glance magnitude for triage).
+CVSS_BAND = {
+    "CRITICAL": "9.8", "HIGH": "8.1", "MEDIUM": "5.4",
+    "LOW": "3.1", "INFO": "0.0", "SAFE": "—",
+}
 # SAFE = "we actively tested this and it was NOT exploitable" — kept in the
 # report so a reader can tell verified-safe apart from simply-untested.
 
