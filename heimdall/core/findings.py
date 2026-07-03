@@ -76,6 +76,20 @@ def _render_md(findings: list[Finding], meta: dict) -> str:
     L.append(f"| {_SEV_BADGE['SAFE']} | {len(safe)} |")
     L.append("")
 
+    from .chains import build_chains
+    chains = build_chains(findings)
+    if chains:
+        L.append("## Attack chains\n")
+        L.append("How the findings compose into end-to-end attacks (highest-impact first):\n")
+        for i, c in enumerate(chains, 1):
+            L.append(f"### ⛓️ {i}. [{c.severity}] {c.title}\n")
+            for step in c.steps:
+                L.append(f"1. {step}")
+            L.append("")
+            if c.finding_ids:
+                L.append(f"*Chained findings: {', '.join('`' + fid + '`' for fid in c.finding_ids)}*\n")
+        L.append("---\n")
+
     L.append("### Findings at a glance\n")
     L.append("| # | Severity | OWASP | Finding |")
     L.append("|---|---|---|---|")
