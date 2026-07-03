@@ -1,20 +1,21 @@
-"""A04 / API6 — Business-logic numeric abuse.
+"""A04 / API6 — Business-logic numeric abuse (behavioural, hint-free).
 
-The highest-impact API bugs are often not injection but *logic*: a money or
-quantity field that accepts a value it never should. A negative ``amount`` that
-credits instead of debits a wallet, a negative ``quantity`` that underpays an
-order, an oversized value that overflows a total — these pass every syntactic
-validator and only a business rule would catch them.
+The classic logic bug: a numeric field used in arithmetic with no bound check, so
+a negative value inverts the intended effect — a negative "amount" that *credits*
+a wallet instead of debiting it, a negative "quantity" that pays you.
 
-Black-box we can't prove the downstream effect, but we can find the *missing
-validation* that enables it: take a money/quantity field, send a benign positive
-value (baseline), then send negative / zero / huge values and see whether the
-endpoint still accepts them. Acceptance of a negative amount on a
-payment/order/wallet field is a strong lead — reported as MEDIUM "verify business
-impact", not a confirmed exploit. To keep precision high we only probe fields
-whose *name* denotes money or quantity (generic numbers like coordinates or
-deltas legitimately go negative), and only when the positive baseline succeeded.
+This inspects NO field names (no money/quantity keyword list — the same
+discipline as the race/workflow modules). It fuzzes *every* numeric body field
+and lets behaviour decide, via a sign differential:
 
+  * send the field a positive value, a negative value, and a small baseline;
+  * watch every numeric field in the response. If some value moves one way for
+    the positive input and the OPPOSITE way for the negative input, the field is
+    used in unchecked arithmetic and negation reverses the effect — a confirmed
+    exploitable inversion, not a guess. (A value that just echoes the input, or
+    an id/timestamp that only ever increases, is excluded automatically.)
+
+If the negative value is instead rejected, the endpoint validates bounds (good).
 Writes state, so FULL mode only.
 """
 
@@ -25,22 +26,12 @@ import requests
 from ..core.context import Context
 from ..core.reqbuild import build_request
 from ..core.taxonomy import REFS
-from ..discovery.openapi import body_field_names
 from .base import module
 
-# Field names where a negative / oversized value implies a business-logic abuse.
-_MONEY_QTY = ("amount", "price", "quantity", "qty", "count", "total", "balance",
-              "credit", "debit", "cost", "sum", "units", "stock", "points",
-              "discount", "fee", "cents", "wallet", "refund", "payment",
-              "charge", "deposit", "withdraw", "shares", "tokens", "coins")
-# Values that a correct money/quantity validator should reject.
-_ABUSE_VALUES = [
-    ("negative", -100),
-    ("zero", 0),
-    ("overflow", 2_147_483_648),        # > int32
-    ("huge", 10 ** 12),
-]
-_MAX_FIELDS = 25
+_BASE = 1
+_POS = 1000
+_NEG = -1000
+_MAX_FIELDS = 30
 
 
 @module("business-logic", "Business-Logic Numeric Abuse", destructive=True)
@@ -51,21 +42,31 @@ def run(ctx: Context) -> None:
     token = _actor_token(ctx)
     targets = _discover(ctx)
     if not targets:
-        ctx.note("business-logic: no money/quantity fields on writable endpoints")
+        ctx.note("business-logic: no numeric body fields on writable endpoints")
         return
 
-    leads: list[dict] = []
+    inversions: list[dict] = []
+    validated = unreached = 0
     probed = 0
     for route, field in targets[:_MAX_FIELDS]:
         probed += 1
-        _probe_field(ctx, route, field, token, leads)
+        outcome = _probe_field(ctx, route, field, token)
+        if outcome == "validated":
+            validated += 1
+        elif outcome == "unreached":
+            unreached += 1
+        elif isinstance(outcome, dict):
+            inversions.append(outcome)
 
-    ctx.note(f"business-logic: probed {probed} money/quantity field(s); "
-             f"{len(leads)} accepted an abusive value")
-    if leads:
-        _report(ctx, leads)
-    elif probed:
-        _report_safe(ctx, probed)
+    ctx.note(f"business-logic: fuzzed {probed} numeric field(s) with ±values — "
+             f"{len(inversions)} inverted under negation, {validated} rejected "
+             f"the negative, {unreached} unreachable")
+    if inversions:
+        _report(ctx, inversions)
+    elif validated:
+        _report_safe(ctx, validated, unreached)
+    elif unreached:
+        _report_untested(ctx, unreached)
 
 
 def _actor_token(ctx: Context) -> str | None:
@@ -73,92 +74,125 @@ def _actor_token(ctx: Context) -> str | None:
     return princ.token if princ and princ.authed else None
 
 
-def _is_money_qty(name: str) -> bool:
-    n = name.lower()
-    return any(h in n for h in _MONEY_QTY)
-
-
 def _discover(ctx: Context) -> list[tuple]:
+    """Every integer/number body field — by schema type, never by name."""
     out, seen = [], set()
     for r in ctx.routes:
         if r.method not in ("POST", "PUT", "PATCH"):
             continue
-        props = (r.body_schema or {}).get("properties", {}) or {}
-        for name in body_field_names(r):
-            sch = props.get(name, {})
-            is_num = isinstance(sch, dict) and sch.get("type") in ("integer", "number")
-            # fall back to name if schema type is absent/unresolved
-            if (is_num or not sch) and _is_money_qty(name) and (r.key, name) not in seen:
+        for name, sch in ((r.body_schema or {}).get("properties", {}) or {}).items():
+            if isinstance(sch, dict) and sch.get("type") in ("integer", "number") \
+                    and (r.key, name) not in seen:
                 seen.add((r.key, name))
                 out.append((r, name))
     return out
 
 
-def _probe_field(ctx, route, field, token, leads) -> None:
+def _fire(ctx, route, field, value, token):
     path = route.fill_path({p: "1" for p in route.path_params})
-    # Baseline with a valid positive value; if that path doesn't even work, we
-    # can't attribute an abusive acceptance to missing validation.
     try:
-        _, base_body = build_request(ctx, route, token, overrides={field: 1})
-        base = ctx.request(route.method, path, token=token, json=base_body,
+        _, body = build_request(ctx, route, token, overrides={field: value})
+        resp = ctx.request(route.method, path, token=token, json=body,
                            timeout=12, retry_429=False)
     except requests.RequestException:
-        return
-    if base.status_code >= 400:
-        return
+        return None
+    return resp
 
-    accepted = []
-    for label, value in _ABUSE_VALUES:
-        try:
-            _, body = build_request(ctx, route, token, overrides={field: value})
-            resp = ctx.request(route.method, path, token=token, json=body,
-                               timeout=12, retry_429=False)
-        except requests.RequestException:
+
+def _nums(resp) -> dict:
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {}
+    for kp, _key, val in _walk(data):
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            out[kp] = val
+    return out
+
+
+def _walk(obj, prefix="", depth=0):
+    if depth > 5:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kp = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, (dict, list)):
+                yield from _walk(v, kp, depth + 1)
+            else:
+                yield kp, str(k), v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj[:20]):
+            yield from _walk(item, f"{prefix}[{i}]", depth + 1)
+
+
+def _probe_field(ctx, route, field, token):
+    base = _fire(ctx, route, field, _BASE, token)
+    if base is None or base.status_code >= 400:
+        return "unreached"
+    pos = _fire(ctx, route, field, _POS, token)
+    neg = _fire(ctx, route, field, _NEG, token)
+    if pos is None or neg is None:
+        return "unreached"
+    if pos.status_code < 400 and neg.status_code >= 400:
+        return "validated"          # positive ok, negative rejected → bounds checked ✓
+    if pos.status_code >= 400 or neg.status_code >= 400:
+        return "unreached"          # positive itself failed — no clean signal
+
+    r0, rp, rn = _nums(base), _nums(pos), _nums(neg)
+    inverted = []
+    for kp in r0:
+        if kp not in rp or kp not in rn:
             continue
-        # Only the truly-abusive ones matter: negative/overflow accepted where a
-        # money/quantity validator should have rejected them. (Zero is a weaker
-        # signal; keep it but don't lead on it.)
-        if resp.status_code < 400 and label in ("negative", "overflow", "huge"):
-            accepted.append((label, value, resp.status_code))
-    if accepted:
-        leads.append({"route": route, "field": field, "accepted": accepted,
-                      "base_status": base.status_code})
+        # Skip a value that just echoes our injected input.
+        if rp[kp] == _POS and rn[kp] == _NEG:
+            continue
+        dp, dn = rp[kp] - r0[kp], rn[kp] - r0[kp]
+        if dp != 0 and dn != 0 and (dp > 0) != (dn > 0):
+            inverted.append((kp, r0[kp], rp[kp], rn[kp]))
+    if inverted:
+        return {"route": route, "field": field, "inverted": inverted}
+    return "validated"              # both accepted but nothing inverted → benign
 
 
 # ── findings ─────────────────────────────────────────────────────────────────
 
-def _report(ctx: Context, leads: list[dict]) -> None:
-    lead = leads[0]
+def _report(ctx: Context, inversions: list[dict]) -> None:
+    lead = inversions[0]
     r = lead["route"]
     lines = []
-    for x in leads[:15]:
+    for x in inversions[:15]:
         xr = x["route"]
-        vals = ", ".join(f"{lbl}={val}→HTTP{st}" for lbl, val, st in x["accepted"])
-        lines.append(f"  {xr.method} {xr.path}  field '{x['field']}': {vals}")
+        kp, v0, vp, vn = x["inverted"][0]
+        lines.append(f"  {xr.method} {xr.path}  field '{x['field']}': "
+                     f"{kp} = {vp} (input +{_POS}) vs {vn} (input {_NEG}) "
+                     f"[baseline {v0}] — effect inverts under negation")
     ctx.finding(
-        id="a04-numeric-business-logic",
-        owasp="A04", severity="MEDIUM",
-        title=(f"Money/quantity field '{lead['field']}' accepts abusive values on "
-               f"{r.method} {r.path}"
-               + (f" (+{len(leads) - 1} more)" if len(leads) > 1 else "")),
+        id="a04-numeric-inversion",
+        owasp="A04", severity="HIGH",
+        title=(f"Sign-inverting numeric field '{lead['field']}' on {r.method} "
+               f"{r.path}"
+               + (f" (+{len(inversions) - 1} more)" if len(inversions) > 1 else "")),
         summary=(
-            "A money/quantity field accepts negative and/or oversized values that "
-            "a business-rule validator should reject (the positive-value baseline "
-            "was accepted too, so the path is live). Depending on how the value is "
-            "used downstream this enables classic logic abuse — a negative amount "
-            "that credits a wallet instead of charging it, a negative quantity "
-            "that underpays an order, or an overflowed total. This is a LEAD: the "
-            "missing input validation is confirmed, the financial impact is not — "
-            "trace the field to its effect. Enforce server-side bounds (> 0, "
-            "sane maximums) on every money/quantity field."
+            "A numeric field is used in unchecked arithmetic: sending it a "
+            "positive value moved a result one way and sending it a negative "
+            "value moved the same result the OPPOSITE way. Negating the input "
+            "reverses the operation's effect — the hallmark of a business-logic "
+            "abuse where a negative amount credits instead of charges, a negative "
+            "quantity pays the buyer, or a negative transfer drains the other "
+            "account. The inversion is observed, not inferred from the field's "
+            "name. Enforce server-side bounds (> 0, sane maximums) on every value "
+            "that feeds a balance / total / quantity computation."
         ),
         evidence="\n".join(lines),
         route=f"{r.method} {r.path}",
-        request=f"{r.method} {r.path}  ({lead['field']} = -100 / 2147483648)",
+        request=f"{r.method} {r.path}  ({lead['field']} = {_NEG})",
         reproduction=(
-            f"Send {r.method} {r.path} with '{lead['field']}': -100 (and again with "
-            f"2147483648); both are accepted. Follow the value to its wallet/order/"
-            f"total effect to confirm the business impact."
+            f"Send {r.method} {r.path} with '{lead['field']}' = {_POS} and note "
+            f"{lead['inverted'][0][0]}={lead['inverted'][0][2]}; resend with "
+            f"{lead['field']} = {_NEG} and observe it become "
+            f"{lead['inverted'][0][3]} — the effect reverses, so a negative input "
+            "runs the operation backwards in the attacker's favour."
         ),
         references=[REFS["A04"], REFS["api6"],
                     "https://portswigger.net/web-security/logic-flaws"],
@@ -166,17 +200,36 @@ def _report(ctx: Context, leads: list[dict]) -> None:
     )
 
 
-def _report_safe(ctx: Context, probed: int) -> None:
+def _report_safe(ctx: Context, validated: int, unreached: int) -> None:
     ctx.finding(
-        id="a04-numeric-business-logic-safe",
+        id="a04-business-logic-safe",
         owasp="A04", severity="SAFE",
-        title="Money/quantity fields reject abusive values",
+        title="Numeric fields reject or bound negative/oversized values",
         summary=(
-            f"Sent negative, zero and overflow values to {probed} money/quantity "
-            "field(s); each was rejected (while a positive baseline was accepted), "
-            "consistent with server-side bounds validation. Multi-step logic flows "
-            "(coupon reuse, race-based double-spend, workflow-order bypass) aren't "
-            "covered by this single-request check and still warrant manual review."
+            f"Fuzzed numeric body fields with positive and negative values; "
+            f"{validated} either rejected the negative outright or produced no "
+            "sign-inverting effect (the operation didn't run backwards). "
+            + (f"{unreached} could not be exercised (preconditions unmet). "
+               if unreached else "")
+            + "This catches single-request numeric inversion; multi-step logic "
+            "(coupon stacking, workflow step-skipping, quantity limits across "
+            "requests) still needs manual modelling."
+        ),
+        references=[REFS["A04"], REFS["api6"]],
+    )
+
+
+def _report_untested(ctx: Context, unreached: int) -> None:
+    ctx.finding(
+        id="a04-business-logic-untested",
+        owasp="A04", severity="INFO",
+        title=f"{unreached} numeric field(s) could not be fuzzed",
+        summary=(
+            f"Found {unreached} numeric body field(s) but the requests didn't "
+            "succeed with a baseline value (preconditions / related resources / "
+            "authorization that black-box synthesis couldn't satisfy), so the "
+            "±value differential wasn't exercised — not a clean bill of health. "
+            "Re-run with valid seeded prerequisites, or test these fields manually."
         ),
         references=[REFS["A04"], REFS["api6"]],
     )

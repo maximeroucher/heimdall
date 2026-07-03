@@ -25,14 +25,12 @@ from ..core.context import Context
 from ..core.taxonomy import REFS
 from .base import module
 
-# Strong page-size parameter names (kept tight to avoid flagging filter params
-# that merely happen to be numeric, e.g. a clothing "size").
-_PAGE_SIZE_PARAMS = {"limit", "per_page", "perpage", "page_size", "pagesize",
-                     "page_limit", "max_results", "maxresults", "results_per_page",
-                     "page_count", "take", "page_size_limit"}
+# No page-size name list. We test EVERY numeric query param and let behaviour
+# decide: a param is a page-size control only if raising it demonstrably returns
+# MORE items (a filter would not) — then, if the absurd value isn't clamped, it's
+# unbounded. Names are never inspected.
 _ABSURD = 1_000_000
-_SANE = 5
-_MAX_ROUTES = 40
+_MAX_ROUTES = 60
 
 
 @module("resource-consumption", "Unrestricted Resource Consumption")
@@ -42,7 +40,7 @@ def run(ctx: Context) -> None:
     bulk_targets = _bulk_targets(ctx)
 
     if not page_targets and not bulk_targets:
-        ctx.note("resource-consumption: no page-size params or array-body endpoints")
+        ctx.note("resource-consumption: no numeric query params or array-body endpoints")
         return
 
     uncapped: list[dict] = []
@@ -53,9 +51,9 @@ def run(ctx: Context) -> None:
         if rec:
             uncapped.append(rec)
 
-    ctx.note(f"resource-consumption: probed {probed} page-size param(s), "
-             f"{len(uncapped)} enforced no maximum; {len(bulk_targets)} "
-             "array-body endpoint(s) checked for maxItems")
+    ctx.note(f"resource-consumption: probed {probed} numeric query param(s), "
+             f"{len(uncapped)} control result-size with no maximum; "
+             f"{len(bulk_targets)} array-body endpoint(s) checked for maxItems")
     _report(ctx, uncapped, bulk_targets, probed)
 
 
@@ -67,13 +65,18 @@ def _actor_token(ctx: Context) -> str | None:
 # ── discovery ────────────────────────────────────────────────────────────────
 
 def _pagination_targets(ctx: Context) -> list[tuple]:
+    """Every numeric query param on a GET (structural: schema type, not name)."""
     out, seen = [], set()
     for r in ctx.routes:
         if r.method != "GET":
             continue
         for p in r.query_params:
-            name = p.get("name") if isinstance(p, dict) else None
-            if name and name.lower() in _PAGE_SIZE_PARAMS and (r.key, name) not in seen:
+            if not isinstance(p, dict):
+                continue
+            name = p.get("name")
+            ptype = (p.get("schema") or {}).get("type")
+            if name and ptype in ("integer", "number", None) \
+                    and (r.key, name) not in seen:
                 seen.add((r.key, name))
                 out.append((r, name))
     return out
@@ -102,19 +105,23 @@ def _bulk_targets(ctx: Context) -> list[dict]:
 def _probe_pagination(ctx, route, param, token) -> dict | None:
     path = route.fill_path({p: "1" for p in route.path_params})
     try:
-        base = ctx.get(path, params={param: _SANE}, token=token, timeout=10,
-                       retry_429=False)
+        low = ctx.get(path, params={param: 1}, token=token, timeout=10,
+                      retry_429=False)
         huge = ctx.get(path, params={param: _ABSURD}, token=token, timeout=15,
                        retry_429=False)
     except requests.RequestException:
         return None
-    if base.status_code >= 400:
-        return None  # endpoint not reachable with a sane value — can't attribute
-    # A server-side maximum rejects (422/400) or clamps the absurd value. If the
-    # absurd request is accepted just like the sane one, no maximum is enforced.
-    if huge.status_code < 400:
-        return {"route": route, "param": param, "base_items": _count(base),
-                "huge_items": _count(huge), "huge_bytes": len(huge.content)}
+    if low.status_code >= 400:
+        return None
+    c_low, c_high = _count(low), _count(huge)
+    # Behavioural proof of a page-size control: a larger value returns MORE items
+    # (a filter/other numeric param would not), AND the absurd value is accepted
+    # rather than clamped/rejected → no server-side maximum. This never inspects
+    # the parameter's name.
+    if (c_low is not None and c_high is not None and c_high > c_low
+            and huge.status_code < 400):
+        return {"route": route, "param": param, "base_items": c_low,
+                "huge_items": c_high, "huge_bytes": len(huge.content)}
     return None
 
 

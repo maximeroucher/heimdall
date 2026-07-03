@@ -50,9 +50,9 @@ def run(ctx: Context) -> None:
     reflections: list[dict] = []
     rejected = 0
     probed = 0
-    for route, is_reset in targets[:_MAX_TARGETS]:
+    for route in targets[:_MAX_TARGETS]:
         probed += 1
-        outcome = _probe(ctx, route, token, is_reset)
+        outcome = _probe(ctx, route, token)
         if outcome == "rejected":
             rejected += 1
         elif isinstance(outcome, dict):
@@ -71,24 +71,16 @@ def _actor_token(ctx: Context) -> str | None:
     return princ.token if princ and princ.authed else None
 
 
-# ── target selection ─────────────────────────────────────────────────────────
+# ── target selection (structural, no name inspection) ────────────────────────
 
-_RESET_HINTS = ("forgot", "reset", "password", "recover", "magic", "verify",
-                "confirm", "activation", "invite")
-
-
-def _select_targets(ctx: Context) -> list[tuple]:
-    """Prefer password-reset-style endpoints (where reflection = takeover), then
-    a few generic GETs that might emit absolute URLs / redirects."""
-    reset, generic = [], []
-    for r in ctx.routes:
-        low = r.path.lower()
-        if r.method in ("POST", "PUT") and any(h in low for h in _RESET_HINTS):
-            reset.append((r, True))
-        elif r.method == "GET" and not r.has_path_param:
-            generic.append((r, False))
-    # Also fold in the discovered auth endpoints explicitly if present.
-    return reset + generic[:8]
+def _select_targets(ctx: Context) -> list:
+    """A broad structural sample — GETs plus a capped set of write endpoints. We
+    never pick endpoints by name (no 'reset'/'password' guessing); whether a
+    poisoned Host is reflected is the only thing that matters, and that's
+    behavioural."""
+    gets = [r for r in ctx.routes if r.method == "GET" and not r.has_path_param]
+    writes = [r for r in ctx.routes if r.method in ("POST", "PUT", "PATCH")]
+    return gets + writes[:12]
 
 
 # ── probing ──────────────────────────────────────────────────────────────────
@@ -135,7 +127,7 @@ def _canary_in(resp) -> str | None:
     return None
 
 
-def _probe(ctx: Context, route, token, is_reset: bool):
+def _probe(ctx: Context, route, token):
     """Return a reflection record dict, "rejected", or None."""
     baseline = _fire(ctx, route, token, {})
     # If the canary somehow already appears with a clean Host, it's not our doing.
@@ -153,7 +145,7 @@ def _probe(ctx: Context, route, token, is_reset: bool):
         where = _canary_in(resp)
         if where and not base_has:
             return {
-                "route": route, "is_reset": is_reset,
+                "route": route,
                 "vector": next(iter(headers)), "headers": headers,
                 "where": where, "status": resp.status_code,
             }
@@ -163,56 +155,39 @@ def _probe(ctx: Context, route, token, is_reset: bool):
 # ── findings ─────────────────────────────────────────────────────────────────
 
 def _report_reflection(ctx: Context, refl: list[dict]) -> None:
-    has_reset = any(r["is_reset"] for r in refl)
-    lead = next((r for r in refl if r["is_reset"]), refl[0])
+    lead = refl[0]
     r = lead["route"]
-    lines = []
-    for c in refl[:15]:
-        cr = c["route"]
-        tag = " [password-reset/link flow]" if c["is_reset"] else ""
-        lines.append(
-            f"  {cr.method} {cr.path}{tag}\n"
-            f"      via {c['vector']}: {_CANARY} -> reflected in {c['where']}"
-        )
-    # Reflection in a reset/link flow = account takeover risk → MEDIUM (HIGH-ish);
-    # generic reflection is only conditionally exploitable → LOW.
-    severity = "MEDIUM" if has_reset else "LOW"
+    lines = [f"  {c['route'].method} {c['route'].path}\n"
+             f"      via {c['vector']}: {_CANARY} -> reflected in {c['where']}"
+             for c in refl[:15]]
     ctx.finding(
         id="a05-host-header-reflection",
-        owasp="A05", severity=severity,
+        owasp="A05", severity="MEDIUM",
         title=(f"Client-controlled Host reflected on {r.method} {r.path}"
-               + (" (password-reset poisoning)" if has_reset else "")
                + (f" (+{len(refl) - 1} more)" if len(refl) > 1 else "")),
         summary=(
             "The application echoes a caller-supplied Host / X-Forwarded-Host "
             "header back into an absolute URL without validating it against an "
-            "allow-list. "
-            + ("Because this happens on a password-reset / verification flow, an "
-               "attacker can request a reset for a victim and have the emailed "
-               "link point at their own host — when the victim clicks it, the "
-               "reset token is sent to the attacker: full account takeover. "
-               if has_reset else
-               "Wherever the app turns this into an emailed or absolute link, an "
-               "attacker can point that link at their own host. (Web-cache "
-               "poisoning would additionally require a CDN/reverse-proxy cache in "
-               "front — FastAPI has none itself — so it is deployment-conditional "
-               "here, not assumed.) ")
-            + "Validate Host/X-Forwarded-Host against an explicit allow-list "
-            "(FastAPI's TrustedHostMiddleware) and build outbound URLs from "
-            "server-side configuration, not request headers."
+            "allow-list. Wherever the app turns that URL into an emailed or "
+            "absolute link — a password-reset / verification link is the classic "
+            "case — an attacker can point it at their own host: request a reset "
+            "for a victim with a poisoned Host and the emailed link (and its "
+            "token) goes to the attacker, i.e. account takeover. (Web-cache "
+            "poisoning would additionally require a CDN/reverse-proxy cache in "
+            "front — FastAPI has none itself — so that angle is "
+            "deployment-conditional, not assumed.) Validate Host/X-Forwarded-Host "
+            "against an explicit allow-list (FastAPI's TrustedHostMiddleware) and "
+            "build outbound URLs from server-side configuration, not request "
+            "headers."
         ),
         evidence="\n".join(lines),
         route=f"{r.method} {r.path}",
         request=(f"{r.method} {r.path}  with {lead['vector']}: {_CANARY}"),
         reproduction=(
             f"Send {r.method} {r.path} with header '{lead['vector']}: {_CANARY}' "
-            f"and observe {_CANARY} reflected in {lead['where']}. "
-            + ("For the reset flow, trigger a real reset for a test victim with "
-               "this header and confirm the emailed link host is attacker-"
-               "controlled." if has_reset else
-               "Trace where this value becomes an emailed/absolute link; if a "
-               "CDN/reverse-proxy cache fronts the app, also test whether the "
-               "poisoned URL can be cached and served to a second client.")
+            f"and observe {_CANARY} reflected in {lead['where']}. Trace where this "
+            "value becomes an emailed/absolute link (esp. a reset/verification "
+            "flow) and confirm the link host is attacker-controlled."
         ),
         references=[REFS["A05"],
                     "https://portswigger.net/web-security/host-header",

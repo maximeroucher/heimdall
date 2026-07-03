@@ -38,14 +38,10 @@ _PAYLOADS = [
     (f"/\\{_CANARY_HOST}/", _CANARY_HOST),
 ]
 
-# Params whose whole job is to say "where to go next".
-_REDIRECT_NAMES = (
-    "next", "redirect", "redirect_uri", "redirect_url", "redirecturl", "return",
-    "return_to", "returnto", "returnurl", "return_url", "url", "callback",
-    "callback_url", "continue", "dest", "destination", "goto", "target", "to",
-    "forward", "forward_url", "success_url", "failure_url", "back", "backurl",
-)
-_MAX_CANDIDATES = 30
+# No parameter-name list: we don't guess which param "looks like" a redirect.
+# Every reachable param gets the canary URL, and the server actually issuing a
+# redirect to the canary host is the only thing that flags it (behavioural).
+_MAX_CANDIDATES = 80
 
 
 @module("open-redirect", "Open Redirect")
@@ -53,7 +49,7 @@ def run(ctx: Context) -> None:
     token = _actor_token(ctx)
     candidates = _discover(ctx)
     if not candidates:
-        ctx.note("open-redirect: no redirect-like parameters in the API surface")
+        ctx.note("open-redirect: no parameters in the API surface to probe")
         return
 
     confirmed: list[dict] = []
@@ -68,7 +64,7 @@ def run(ctx: Context) -> None:
         if hit:
             confirmed.append(hit)
 
-    ctx.note(f"open-redirect: probed {probed} redirect-like param(s), "
+    ctx.note(f"open-redirect: probed {probed} param(s), "
              f"{len(confirmed)} redirected to the attacker canary host")
     if confirmed:
         _report_confirmed(ctx, confirmed)
@@ -83,23 +79,20 @@ def _actor_token(ctx: Context) -> str | None:
 
 # ── discovery ────────────────────────────────────────────────────────────────
 
-def _is_redirect_name(name: str) -> bool:
-    n = name.lower().replace("-", "_")
-    return n in _REDIRECT_NAMES
-
-
 def _discover(ctx: Context) -> list[tuple]:
+    """Every query param and string body field — no name filtering. The redirect
+    behaviour, not the name, decides."""
     out: list[tuple] = []
     seen: set = set()
     for r in ctx.routes:
         for p in r.query_params:
             name = p.get("name") if isinstance(p, dict) else None
-            if name and _is_redirect_name(name) and (r.key, name, "query") not in seen:
+            if name and (r.key, name, "query") not in seen:
                 seen.add((r.key, name, "query"))
                 out.append((r, name, "query"))
         if r.method in ("POST", "PUT", "PATCH"):
             for name in body_field_names(r):
-                if _is_redirect_name(name) and (r.key, name, "body") not in seen:
+                if (r.key, name, "body") not in seen:
                     seen.add((r.key, name, "body"))
                     out.append((r, name, "body"))
     return out
@@ -223,7 +216,7 @@ def _report_safe(ctx: Context, probed: int) -> None:
         title="Redirect parameters validated (no open redirect)",
         summary=(
             f"Sent attacker-host canary URLs (absolute, scheme-relative, and "
-            f"suffix-trick bypasses) through {probed} redirect-like parameter(s); "
+            f"suffix-trick bypasses) through {probed} parameter(s); "
             "none produced a redirect to the attacker host, consistent with "
             "server-side allow-listing of redirect targets."
         ),
