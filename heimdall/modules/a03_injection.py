@@ -489,16 +489,24 @@ def _path_traversal_probe(ctx: Context) -> None:
         )
 
 
-# ── Prototype / class pollution ───────────────────────────────────────────────
+# ── Object / class pollution ─────────────────────────────────────────────────
 
-# Prototype pollution is a JavaScript/Node phenomenon (Object.prototype). A pure
-# Python backend has no prototype chain, so this is impactful mainly when the
-# FastAPI app MERGES attacker JSON and forwards it to a Node service (or uses an
-# unsafe recursive merge). We inject the canonical pollution keys with a canary
-# and confirm behaviourally: does the canary later LEAK into an unrelated
-# response (server-side pollution), or does a pollution key crash a merge (500)?
+# Object/class pollution: an unsafe recursive merge / setattr of attacker JSON
+# lets special keys mutate SHARED state, so a property set on one object appears
+# on others. Two flavours, both real:
+#   * Python  — recursive setattr reaching the class/globals chain
+#     (__class__.__init__.__globals__, __class__.__dict__, __defaults__, …),
+#   * JS/Node — __proto__ / constructor.prototype polluting Object.prototype.
+# We inject the canonical keys with a canary and confirm behaviourally: does the
+# canary LEAK into an unrelated response (pollution) or 500 a merge?
 _PP_NONCE = "heimdallpp31337"
 _PP_PAYLOADS = [
+    # Python class pollution (recursive setattr/merge gadgets)
+    {"__class__": {"__init__": {"__globals__": {"heimdallPolluted": _PP_NONCE}}}},
+    {"__init__": {"__globals__": {"heimdallPolluted": _PP_NONCE}}},
+    {"__class__": {"__dict__": {"heimdallPolluted": _PP_NONCE}}},
+    {"__class__": {"heimdallPolluted": _PP_NONCE}},
+    # JS/Node prototype pollution (when the API merges JSON forwarded downstream)
     {"__proto__": {"heimdallPolluted": _PP_NONCE}},
     {"constructor": {"prototype": {"heimdallPolluted": _PP_NONCE}}},
     {"__proto__": {"status": _PP_NONCE, "role": _PP_NONCE}},
@@ -511,10 +519,12 @@ def _prototype_pollution(ctx: Context) -> None:
         return
     token = _actor_token(ctx)
     princ = ctx.principal("attacker", "user")
+    # Any JSON-object body — INCLUDING free-form/dict bodies (no declared fields),
+    # which are prime pollution targets precisely because they merge arbitrary keys.
     write_routes = [r for r in ctx.routes.by_method("POST", "PUT", "PATCH")
-                    if body_field_names(r)][:20]
+                    if r.body_schema is not None][:25]
     if not write_routes:
-        ctx.note("no JSON-body write routes; prototype-pollution probe skipped")
+        ctx.note("no JSON-body write routes; object-pollution probe skipped")
         return
 
     sent, crashed = [], []
@@ -525,11 +535,11 @@ def _prototype_pollution(ctx: Context) -> None:
             try:
                 resp = ctx.request(r.method, path, token=token, json=body)
             except Exception as exc:  # noqa: BLE001
-                ctx.note(f"proto-pollution probe {r.method} {r.path} failed: {exc}")
+                ctx.note(f"object-pollution probe {r.method} {r.path} failed: {exc}")
                 continue
-            sent.append((r, path, body))
+            sent.append((r, path, body, pp))
             if resp.status_code >= 500:
-                crashed.append((r, path))
+                crashed.append((r, path, pp))
 
     # Two-step: did the injected canary LEAK into an unrelated response? That is
     # the confirmation of real server-side pollution (a fresh object gained our
@@ -546,48 +556,51 @@ def _prototype_pollution(ctx: Context) -> None:
 
     if leaked:
         gr, _ = leaked
-        r0, p0, b0 = sent[0]
+        r0, p0, b0, pp0 = sent[0]
         ctx.finding(
-            id="a03-prototype-pollution", owasp="A03", severity="HIGH",
-            title="Prototype/object pollution — injected property leaked into another response",
+            id="a03-object-pollution", owasp="A03", severity="HIGH",
+            title="Object/class pollution — injected property leaked into another response",
             summary=(
-                "A `__proto__` / `constructor.prototype` payload was merged server-side and "
-                f"our canary later appeared in the unrelated response of `GET {gr.path}` — the "
-                "injected property leaked onto other objects. This is prototype/object "
-                "pollution (typical when JSON is deep-merged, often in a downstream Node "
-                "service): it can flip auth flags, defaults or config for every request. "
-                "Reject `__proto__`/`constructor`/`prototype` keys and use safe merges."
+                "A special-key payload (Python `__class__` / `__init__` / `__globals__`, or JS "
+                "`__proto__` / `constructor.prototype`) was merged server-side and our canary "
+                f"later appeared in the unrelated response of `GET {gr.path}` — the injected "
+                "property leaked onto other objects / shared state. This is object/class "
+                "pollution: an unsafe recursive merge or `setattr` lets an attacker flip auth "
+                "flags, defaults, or config globally (in Python by reaching the class/globals "
+                "chain; in Node by polluting Object.prototype). Reject `__class__` / `__proto__`"
+                " / `constructor` / dunder keys and never recursively merge/setattr raw input."
             ),
-            evidence=f"polluted via {r0.method} {p0} with {_PP_PAYLOADS[0]}\n"
+            evidence=f"polluted via {r0.method} {p0} with {pp0}\n"
                      f"canary '{_PP_NONCE}' then observed in GET {gr.path}",
             route=f"{r0.method} {r0.path}",
             request=f"{r0.method} {p0}\nContent-Type: application/json\n\n{b0}",
-            references=[REFS["A03"], "https://portswigger.net/web-security/prototype-pollution"],
-            tools=["Burp (server-side prototype pollution scanner)", "ppmap"],
+            references=[REFS["A03"], "https://blog.abdulrah33m.com/prototype-pollution-in-python/",
+                        "https://portswigger.net/web-security/prototype-pollution"],
+            tools=["Burp (server-side pollution scanner)", "ppmap"],
         )
     elif crashed:
-        r0, p0 = crashed[0]
+        r0, p0, pp0 = crashed[0]
         ctx.finding(
-            id="a03-prototype-pollution", owasp="A03", severity="MEDIUM",
-            title=f"Server error on __proto__/constructor payload ({len(crashed)} route(s))",
+            id="a03-object-pollution", owasp="A03", severity="MEDIUM",
+            title=f"Server error on object/class-pollution payload ({len(crashed)} route(s))",
             summary=(
-                "Sending `__proto__` / `constructor.prototype` keys caused a 500 where a "
-                "valid body did not — the server tried to merge attacker-controlled special "
-                "keys unsafely. Confirm whether this is prototype/class pollution vs. a plain "
-                "crash; either way, reject these keys before any merge."
+                "A `__class__` / `__globals__` / `__proto__` payload caused a 500 where a valid "
+                "body did not — the server tried to recursively merge or `setattr` "
+                "attacker-controlled special keys. Confirm whether this is object/class "
+                "pollution or a plain crash; either way, reject dunder/special keys before any "
+                "merge or attribute assignment."
             ),
-            evidence=f"{r0.method} {p0} returned 500 on a __proto__ payload",
+            evidence=f"{r0.method} {p0} returned 500 on payload {pp0}",
             route=f"{r0.method} {r0.path}",
-            request=f"{r0.method} {p0}  (body includes {_PP_PAYLOADS[0]})",
-            references=[REFS["A03"], "https://portswigger.net/web-security/prototype-pollution"],
+            request=f"{r0.method} {p0}  (body includes {pp0})",
+            references=[REFS["A03"], "https://blog.abdulrah33m.com/prototype-pollution-in-python/"],
             tools=["Burp", "ppmap"],
         )
     elif sent:
         ctx.finding(
-            id="a03-prototype-pollution", owasp="A03", severity="SAFE",
-            title="No prototype/object pollution observed",
-            summary=f"Injected __proto__/constructor payloads into {len(write_routes)} write "
-                    "route(s); the canary never leaked into another response and nothing "
-                    "crashed. (Note: prototype pollution primarily affects JS/Node components "
-                    "downstream of the API.)",
+            id="a03-object-pollution", owasp="A03", severity="SAFE",
+            title="No object/class pollution observed",
+            summary=f"Injected Python (__class__/__globals__) and JS (__proto__/constructor) "
+                    f"pollution payloads into {len(write_routes)} write route(s); the canary "
+                    "never leaked into another response and no merge crashed.",
         )
