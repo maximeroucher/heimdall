@@ -1,22 +1,25 @@
-"""A01 / API3 — Excessive data exposure.
+"""A01 / API3 — Excessive data exposure (credentials + PII / financial).
 
-APIs routinely over-serialize: a response model includes a field the client
-never needs — a password hash, an API token, a signing secret, an OAuth
-refresh token — and it ships to every caller. This is the object-property side
-of access control (OWASP API3), and it's cheap to detect black-box: fetch the
-JSON an endpoint returns and look for property *names* that denote secrets, and
-property *values* that are unmistakably credentials (bcrypt/argon2 hashes, PEM
-keys, JWTs).
+APIs routinely over-serialize: a response includes a field the client never
+needs — a password hash, an API token, a signing secret — or worse, sensitive
+personal / financial data: a credit-card number, a bank IBAN, a Social Security
+Number. This module fetches the JSON an endpoint returns and flags it.
 
-Precision comes from only flagging high-confidence signals: a key literally
-named ``password_hash`` / ``secret`` / ``refresh_token`` carrying a non-empty
-value, or a value matching a credential format — not merely "there's an email
-in the response" (returning your own email is usually fine). Token-issuing auth
-endpoints are excluded, since a token in *their* response is the point.
+The primary detector is BEHAVIOURAL and name-blind: it recognises a sensitive
+VALUE by its own shape/checksum, so it fires even when the field is named
+innocuously (a card number under ``ref`` still gets caught). It validates
+checksums where they exist — Luhn for card PANs, mod-97 for IBANs — to stay
+near-zero-FP, and matches specific provider key formats (AWS/Google/GitHub/
+Stripe/…), password hashes, PEM keys and JWTs. A secondary, lower-confidence
+pass matches field *names* only for values that have no detectable format (a
+plaintext password looks like any string, so only its key can betray it).
+Token-issuing auth endpoints are excluded, since a token in *their* response is
+the point.
 """
 
 from __future__ import annotations
 
+import math
 import re
 
 import requests
@@ -34,14 +37,35 @@ _SECRET_KEYS = {
     "seed_phrase", "mnemonic", "ssn", "social_security", "card_number", "pan",
     "cvv", "cvc", "security_code", "encryption_key", "recovery_code",
 }
-# Value formats that are self-evidently credentials, whatever the key is called.
+# Value formats that are self-evidently sensitive, WHATEVER the field is named —
+# this is the hint-free half: detection is by the value's own shape/checksum, so
+# it catches leaks even when the field has an innocuous name. Credentials/keys:
 _VALUE_PATTERNS = [
     (re.compile(r"^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$"), "bcrypt hash"),
     (re.compile(r"^\$argon2[id]{1,2}\$"), "argon2 hash"),
     (re.compile(r"^\$(?:1|5|6)\$"), "crypt(3) hash"),
     (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), "PEM private key"),
-    (re.compile(r"^eyJ[\w-]+\.[\w-]+\.[\w-]+$"), "JWT"),
+    (re.compile(r"\beyJ[\w-]+\.[\w-]+\.[\w-]+\b"), "JWT"),
+    # Provider secret/API-key formats (each is specific enough to be near-zero FP)
+    (re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[0-9A-Z]{16}\b"), "AWS access key id"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "Google API key"),
+    (re.compile(r"\bgh[posru]_[0-9A-Za-z]{36,}\b"), "GitHub token"),
+    (re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"), "Slack token"),
+    (re.compile(r"\b[sr]k_live_[0-9A-Za-z]{20,}\b"), "Stripe live key"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{40,}\b"), "OpenAI-style secret key"),
+    (re.compile(r"\bSK[0-9a-fA-F]{32}\b"), "Twilio key"),
 ]
+# PII / financial value formats — the "bank account / SSN / card" the user cares
+# about. Cards and IBANs carry checksums, so we VALIDATE them (not just regex) to
+# stay near-zero-FP; an SSN is pattern+range-validated.
+_CARD_RE = re.compile(r"(?<![\d.])\d[\d -]{11,17}\d(?![\d.])")
+_IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b")
+_SSN_RE = re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b")
+# Generic high-entropy secrets (an API key / token with no known prefix). Gated
+# hard to dodge the obvious benign high-entropy strings (UUIDs, hex hashes).
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_TOKENISH = re.compile(r"^[A-Za-z0-9_\-+/=.]{20,128}$")
 # The plain name "token" is common and sometimes legitimately public; only treat
 # it as sensitive off auth flows, handled via _AUTH_HINTS below.
 _WEAK_TOKEN_KEYS = {"token", "auth_token", "bearer", "jwt"}
@@ -97,10 +121,12 @@ def _inspect(ctx: Context, route, token, hits: list[dict]) -> None:
         return
     auth_route = _is_auth_route(route)
     for keypath, key, value in _walk(data):
-        reason = _sensitive(key, value, auth_route)
-        if reason:
+        res = _sensitive(key, value, auth_route)
+        if res:
+            reason, severity = res
             hits.append({"route": route, "keypath": keypath, "key": key,
-                         "reason": reason, "sample": _redact(value)})
+                         "reason": reason, "severity": severity,
+                         "sample": _redact(value)})
             if len([h for h in hits if h["route"] is route]) >= 4:
                 break  # a few per route is enough to make the point
 
@@ -121,21 +147,92 @@ def _walk(obj, prefix="", depth=0):
             yield from _walk(item, prefix + "[]", depth + 1)
 
 
-def _sensitive(key: str, value, auth_route: bool) -> str | None:
+def _luhn_ok(digits: str) -> bool:
+    total, alt = 0, False
+    for ch in reversed(digits):
+        d = ord(ch) - 48
+        if alt:
+            d = d * 2 - 9 if d * 2 > 9 else d * 2
+        total += d
+        alt = not alt
+    return total % 10 == 0
+
+
+def _iban_ok(s: str) -> bool:
+    s = s.replace(" ", "").upper()
+    rearranged = s[4:] + s[:4]
+    digits = "".join(str(ord(c) - 55) if c.isalpha() else c for c in rearranged)
+    try:
+        return int(digits) % 97 == 1
+    except ValueError:
+        return False
+
+
+def _value_leak(sval: str) -> str | None:
+    """Behavioural: is this VALUE itself sensitive, by format/checksum? Never
+    inspects the field name."""
+    for pat, label in _VALUE_PATTERNS:
+        if pat.search(sval):
+            return label
+    # Credit-card PAN: a plausible-length run of digits that passes the Luhn
+    # checksum and starts with a real card major-industry digit (3-6).
+    for m in _CARD_RE.finditer(sval):
+        digits = m.group().replace(" ", "").replace("-", "")
+        if 13 <= len(digits) <= 19 and digits[0] in "3456" \
+                and len(set(digits)) > 1 and _luhn_ok(digits):
+            return "credit-card number (Luhn-valid)"
+    # IBAN: country+check digits then a valid mod-97 checksum.
+    for m in _IBAN_RE.finditer(sval):
+        if _iban_ok(m.group()):
+            return "IBAN bank account (checksum-valid)"
+    if _SSN_RE.search(sval):
+        return "US Social Security Number"
+    return None
+
+
+def _shannon(s: str) -> float:
+    freq: dict = {}
+    for c in s:
+        freq[c] = freq.get(c, 0) + 1
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in freq.values())
+
+
+def _entropy_secret(sval: str) -> bool:
+    """A random-looking token/key with no known prefix. Gated to exclude the
+    common benign high-entropy strings: UUIDs and single-case hex hashes are
+    ruled out by requiring MIXED character classes (upper+lower+digit)."""
+    if not _TOKENISH.match(sval) or _UUID_RE.match(sval):
+        return False
+    if not (any(c.isupper() for c in sval) and any(c.islower() for c in sval)
+            and any(c.isdigit() for c in sval)):
+        return False
+    return _shannon(sval) >= 3.5
+
+
+def _sensitive(key: str, value, auth_route: bool):
+    """Return (reason, severity) or None. Value format/checksum matches are
+    HIGH-confidence; entropy and name-based matches are MEDIUM."""
     if value is None or value == "" or value is True or value is False:
         return None
     kl = key.lower()
     sval = str(value)
-    # 1) value looks like a credential, regardless of the key name
-    for pat, label in _VALUE_PATTERNS:
-        if pat.search(sval):
-            return f"value is a {label}"
-    # 2) key name denotes a secret
+    # 1) the VALUE itself is sensitive by format/checksum — behavioural, name-blind
+    #    (credentials, provider keys, card numbers, IBANs, SSNs). HIGH confidence.
+    vleak = _value_leak(sval)
+    if vleak:
+        return f"value is a {vleak}", "HIGH"
+    # 2) a high-entropy token/key with no known format — behavioural, name-blind.
+    if _entropy_secret(sval):
+        return "value is a high-entropy secret-like string (probable token/key)", "MEDIUM"
+    # 3) field NAME denotes a secret — the fallback for values that have no
+    #    detectable format (a plaintext password looks like any string, so only
+    #    the name can flag it). Lower-confidence than a value match.
     if kl in _SECRET_KEYS:
-        return f"field '{key}' (secret-bearing) is present in the response"
-    # 3) a bare 'token'/'jwt' key — sensitive unless this is a token-issuing route
+        return f"field '{key}' (secret-bearing) is present in the response", "MEDIUM"
+    # 4) a bare 'token'/'jwt' key — sensitive unless this is a token-issuing route
     if kl in _WEAK_TOKEN_KEYS and not auth_route and len(sval) >= 12:
-        return f"field '{key}' exposes a token outside an auth flow"
+        return f"field '{key}' exposes a token outside an auth flow", "MEDIUM"
     return None
 
 
@@ -154,20 +251,24 @@ def _report(ctx: Context, hits: list[dict]) -> None:
         hr = h["route"]
         lines.append(f"  {hr.method} {hr.path}  →  {h['keypath']}  "
                      f"({h['reason']}; sample {h['sample']})")
+    severity = "HIGH" if any(h["severity"] == "HIGH" for h in hits) else "MEDIUM"
     ctx.finding(
         id="a01-excessive-data-exposure",
-        owasp="A01", severity="HIGH",
-        title=(f"Sensitive field exposed in {r.method} {r.path} response"
+        owasp="A01", severity=severity,
+        title=(f"Sensitive data exposed in {r.method} {r.path} response"
                + (f" (+{len(hits) - 1} more)" if len(hits) > 1 else "")),
         summary=(
-            "An API response over-serializes a credential-class property — a "
-            "password hash, token, private key or other secret that no client "
-            "should receive. Anyone authorized to read the object also reads the "
-            "secret: password hashes enable offline cracking, an exposed token / "
-            "refresh token is an immediate account takeover, and a private key is "
-            "game over. Fix at the serializer: define an explicit response schema "
-            "(FastAPI `response_model` with the secret fields excluded / "
-            "`Field(exclude=True)`) rather than returning ORM objects directly."
+            "An API response ships data no client should receive — a credential "
+            "(password hash, token, private key), a provider API key, or "
+            "personal/financial data (a Luhn-valid card number, a checksum-valid "
+            "IBAN, an SSN). Most of these are matched by the value's own "
+            "format/checksum, so the leak is real regardless of how the field is "
+            "named. Impact ranges from offline cracking / account takeover (a "
+            "leaked hash or token) to PCI/PII breach (a card or SSN in a response). "
+            "Fix at the serializer: define an explicit response schema (FastAPI "
+            "`response_model` with sensitive fields excluded / `Field(exclude=True)`) "
+            "rather than returning ORM objects directly, and never place raw "
+            "card/account numbers in an API response."
         ),
         evidence="\n".join(lines),
         route=f"{r.method} {r.path}",
@@ -185,14 +286,15 @@ def _report_safe(ctx: Context, probed: int) -> None:
     ctx.finding(
         id="a01-data-exposure-safe",
         owasp="A01", severity="SAFE",
-        title="No credential-class fields found in API responses",
+        title="No sensitive data found in API responses",
         summary=(
-            f"Walked the JSON of {probed} GET response(s) for secret-bearing "
-            "property names (password_hash, token, secret, private_key, …) and "
-            "credential-format values (bcrypt/argon2 hashes, PEM keys, JWTs); none "
-            "were exposed, consistent with explicit response schemas that strip "
-            "sensitive fields. Property-level authorization on write paths and "
-            "fields only returned to specific roles still merit manual review."
+            f"Walked the JSON of {probed} GET response(s) for sensitive VALUES "
+            "(password/argon2/bcrypt hashes, PEM keys, JWTs, provider API keys, "
+            "Luhn-valid card numbers, checksum-valid IBANs, SSNs, high-entropy "
+            "secrets) and secret-bearing field names; none were exposed, "
+            "consistent with explicit response schemas that strip sensitive fields. "
+            "Fields only returned to specific roles, and write-path responses, "
+            "still merit manual review."
         ),
         references=[REFS["A01"], REFS["api3"]],
     )
