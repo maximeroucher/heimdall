@@ -23,6 +23,7 @@ class Route:
     path_params: list[str] = field(default_factory=list)
     query_params: list[dict] = field(default_factory=list)   # openapi param objs
     body_schema: dict | None = None  # resolved requestBody json schema
+    response_fields: list[str] = field(default_factory=list)  # 2xx response prop names
     raw: dict = field(default_factory=dict)
 
     @property

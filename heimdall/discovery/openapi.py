@@ -123,6 +123,8 @@ def parse_routes(spec: dict) -> RouteMap:
                     body_schema = _deref(content[ct].get("schema"), components)
                     break
 
+            resp_fields = _response_field_names(op, components)
+
             rm.routes.append(Route(
                 path=path,
                 method=method.upper(),
@@ -133,9 +135,31 @@ def parse_routes(spec: dict) -> RouteMap:
                 path_params=path_params,
                 query_params=query_params,
                 body_schema=body_schema,
+                response_fields=resp_fields,
                 raw=op,
             ))
     return rm
+
+
+def _response_field_names(op: dict, components: dict) -> list[str]:
+    """Property names of the first 2xx JSON response schema (statefulness signal:
+    a response carrying balance/stock/scanned/remaining betrays a mutable resource)."""
+    responses = op.get("responses", {})
+    if not isinstance(responses, dict):
+        return []
+    for code in ("200", "201", "202"):
+        r = responses.get(code)
+        if not isinstance(r, dict):
+            continue
+        schema = (r.get("content", {}).get("application/json", {}) or {}).get("schema")
+        schema = _deref(schema, components)
+        if isinstance(schema, dict):
+            if schema.get("type") == "array":
+                schema = _deref(schema.get("items"), components) or {}
+            props = schema.get("properties")
+            if isinstance(props, dict):
+                return list(props.keys())
+    return []
 
 
 def body_field_names(route: Route) -> list[str]:

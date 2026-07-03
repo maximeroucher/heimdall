@@ -8,8 +8,14 @@ on a barrier) at candidate endpoints, then probes sequentially:
   * >1 of the concurrent burst succeeds, AND
   * a later sequential repeat is rejected (the resource is now consumed),
 
-means concurrency defeated a once-only guard — a race. Destructive, so FULL mode
-only; scoped to endpoints whose name implies a limited/one-shot action.
+means concurrency defeated a once-only guard — a race.
+
+Candidate selection is purely BEHAVIOURAL — no verb/schema hint decides what to
+test. Every reachable mutating endpoint is bursted; an endpoint is a limited/once
+operation iff a sequential repeat is rejected afterwards (the resource was
+consumed). Idempotent / unlimited endpoints simply fail that test and aren't
+flagged. Naming is irrelevant, so it finds races the tester never thought to name.
+Destructive (creates/consumes data), so FULL mode only, bounded by a budget.
 """
 
 from __future__ import annotations
@@ -22,20 +28,8 @@ from ..core.http import HttpClient
 from ..core.reqbuild import build_request
 from .base import module
 
-_ONCE_HINTS = (
-    "claim", "redeem", "redemption", "coupon", "voucher", "promo", "apply",
-    "vote", "purchase", "buy", "order", "checkout", "book", "reserve", "register",
-    "use", "consume", "withdraw", "transfer", "cashout", "payout", "refund",
-    "like", "follow", "join", "enroll", "submit", "confirm", "activate", "accept",
-    "spend", "debit", "topup", "recharge", "enter", "signup",
-    "scan", "validate", "ticket", "check-in", "checkin", "collect",
-)
 _BURST = 20
-
-
-def _is_once_op(route) -> bool:
-    blob = f"{route.path} {route.operation_id}".lower()
-    return any(h in blob for h in _ONCE_HINTS)
+_MAX_ENDPOINTS = 60   # cost/destructiveness budget (bursts are ~23 requests each)
 
 
 @module("race", "Race conditions / TOCTOU", destructive=True)
@@ -45,27 +39,40 @@ def run(ctx: Context) -> None:
         return
     princ = ctx.principal("attacker", "user") or ctx.profile.any_authed()
     token = princ.token if princ and princ.authed else None
-    candidates = [
-        r for r in ctx.routes
-        if r.method in ("POST", "PUT", "PATCH", "DELETE")
-        and len(r.path_params) <= 1 and _is_once_op(r)
-    ]
+    # Purely behaviour-driven: burst EVERY reachable mutating endpoint and let the
+    # outcome classify it. No verb/schema hint decides what to test — an endpoint
+    # is a race target iff (a) a burst reaches it and (b) a sequential repeat is
+    # then rejected (proving a consumable/limited invariant). Naming is irrelevant.
+    candidates = [r for r in ctx.routes
+                  if r.method in ("POST", "PUT", "PATCH", "DELETE") and len(r.path_params) <= 1]
     if not candidates:
-        ctx.note("no once/limited-operation endpoints matched; race probes skipped")
+        ctx.note("no mutating endpoints to race")
         return
+    if len(candidates) > _MAX_ENDPOINTS:
+        ctx.note(f"{len(candidates)} mutating endpoints; racing the first {_MAX_ENDPOINTS} "
+                 "(budget — raise _MAX_ENDPOINTS for full coverage)")
+        candidates = candidates[:_MAX_ENDPOINTS]
 
     raced = []
-    tested = 0
-    for r in candidates[:25]:
+    limited = 0        # endpoints whose sequential-repeat proved a once/limited invariant
+    reachable = 0
+    for r in candidates:
         # Build a VALID request (real path/FK ids from related endpoints + typed
-        # body) so the burst reaches the handler instead of 404/422-ing.
+        # body) so the burst reaches the handler instead of 404/422-ing, then let
+        # the OUTCOME classify — no lexical/schema assumption about the endpoint.
         path, body = build_request(ctx, r, token, principal=princ)
         result = _probe(ctx, r.method, path, token, body)
         if result is None:
-            continue
-        tested += 1
+            continue                       # never succeeded -> unreachable / gated
+        reachable += 1
         conc_ok, seq_ok = result
-        if conc_ok >= 2 and seq_ok == 0:
+        # The invariant is "limited/once" iff the resource is now consumed: a
+        # sequential repeat is rejected. Idempotent / unlimited ops (seq still
+        # succeeds) simply aren't race targets. This is the whole classifier.
+        if seq_ok > 0:
+            continue
+        limited += 1
+        if conc_ok >= 2:
             raced.append((r, conc_ok))
 
     if raced:
@@ -73,13 +80,14 @@ def run(ctx: Context) -> None:
                            f"then sequential repeats rejected" for r, n in raced[:15])
         ctx.finding(
             id="a04-race-toctou", owasp="A04", severity="HIGH",
-            title=f"Race condition (TOCTOU) on {len(raced)} once/limited operation(s)",
+            title=f"Race condition (TOCTOU) on {len(raced)} limited operation(s)",
             summary=(
-                "A burst of simultaneous identical requests succeeded MORE THAN ONCE on an "
-                "operation that is rejected on a sequential repeat — the check-then-act guard "
-                "isn't atomic. Depending on the endpoint this enables double-spend, multiple "
-                "redemptions of a one-time code, quota/limit bypass, or duplicate votes. Use "
-                "atomic DB operations / row locks / unique constraints, not read-then-write."
+                "These endpoints enforce a limited/once invariant (a sequential repeat is "
+                "rejected) but a burst of simultaneous identical requests succeeded MORE THAN "
+                "ONCE — the check-then-act guard isn't atomic. Depending on the endpoint this "
+                "enables double-spend, multiple redemptions of a one-time code, quota/limit "
+                "bypass, or duplicate votes. Use atomic DB operations / row locks / unique "
+                "constraints, not read-then-write."
             ),
             evidence=sample,
             reproduction=f"Send ~{_BURST} concurrent identical {raced[0][0].method} "
@@ -88,13 +96,17 @@ def run(ctx: Context) -> None:
                         "https://portswigger.net/web-security/race-conditions"],
             tools=["Burp Turbo Intruder", "ffuf -rate", "custom asyncio script"],
         )
-    elif tested:
+    elif limited:
         ctx.finding(
             id="a04-race-toctou", owasp="A04", severity="SAFE",
-            title="Once/limited operations resist concurrent duplication",
-            summary=f"Fired {_BURST} concurrent requests at {tested} one-shot-looking "
-                    "endpoint(s); none allowed more than a single success — guards look atomic.",
+            title="Limited operations resist concurrent duplication",
+            summary=f"Of {reachable} reachable mutating endpoint(s), {limited} enforced a "
+                    "once/limited invariant (sequential repeat rejected); a concurrent burst "
+                    "of each still yielded a single success — the guards look atomic.",
         )
+    else:
+        ctx.note(f"raced {reachable} reachable mutating endpoint(s); none exposed a "
+                 "limited invariant to break (or preconditions blocked deeper ones)")
 
 
 def _probe(ctx: Context, method: str, path: str, token: str | None, body: dict):
