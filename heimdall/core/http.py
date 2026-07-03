@@ -18,12 +18,34 @@ _MAX_WAIT = 6.0                 # cap any single Retry-After honoured
 
 
 class HttpClient:
-    def __init__(self, base_url: str, *, scheme: str = "Bearer", timeout: float = 30.0):
+    def __init__(self, base_url: str, *, scheme: str = "Bearer", timeout: float = 30.0,
+                 auth_kind: str = "bearer", credential_name: str = ""):
         self.base_url = base_url.rstrip("/")
         self.scheme = scheme
         self.timeout = timeout
+        self.auth_kind = auth_kind
+        self.credential_name = credential_name
         self.s = requests.Session()
         self.s.headers["User-Agent"] = "heimdall/0.1 (+authorized security test)"
+
+    def _apply_credential(self, token: str, headers: dict, kw: dict) -> None:
+        """Attach ``token`` the way this app expects (bearer / basic / api-key
+        header or query / session cookie) so non-JWT auth works transparently."""
+        kind = self.auth_kind
+        if kind == "basic":
+            headers["Authorization"] = f"Basic {token}"
+        elif kind == "apikey_header":
+            headers[self.credential_name or "X-API-Key"] = token
+        elif kind == "apikey_query":
+            params = dict(kw.get("params") or {})
+            params[self.credential_name or "api_key"] = token
+            kw["params"] = params
+        elif kind == "cookie":
+            existing = headers.get("Cookie")
+            crumb = f"{self.credential_name or 'session'}={token}"
+            headers["Cookie"] = f"{existing}; {crumb}" if existing else crumb
+        else:  # bearer (default)
+            headers["Authorization"] = f"{self.scheme} {token}"
 
     def url(self, path: str) -> str:
         return path if path.startswith("http") else f"{self.base_url}{path}"
@@ -42,7 +64,7 @@ class HttpClient:
         if raw_authorization is not None:
             headers["Authorization"] = raw_authorization
         elif token:
-            headers["Authorization"] = f"{self.scheme} {token}"
+            self._apply_credential(token, headers, kw)
         kw.setdefault("timeout", self.timeout)
         kw.setdefault("allow_redirects", False)
         url = self.url(path)

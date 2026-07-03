@@ -72,7 +72,33 @@ def login(http: HttpClient, profile: AppProfile, ident: str, password: str) -> s
                 tok = None
             if tok:
                 return tok
+            # Cookie/session auth: no token in the body, but a session cookie was
+            # set — carry the cookie value as the principal's credential. Also
+            # auto-upgrades apps whose scheme wasn't declared as a cookie scheme.
+            cookie_val = _session_cookie(profile, r)
+            if cookie_val:
+                return cookie_val
     return None
+
+
+def _session_cookie(profile: AppProfile, resp) -> str | None:
+    jar = resp.cookies
+    if not jar:
+        return None
+    named = profile.auth.credential_name
+    if named and named in jar:
+        val = jar.get(named)
+    else:
+        # pick the most session-like cookie
+        pref = next((c.name for c in jar if any(
+            k in c.name.lower() for k in ("session", "sess", "sid", "auth", "token"))), None)
+        name = pref or next(iter(jar.keys()))
+        val = jar.get(name)
+        if profile.auth.auth_kind != "cookie":
+            profile.auth.auth_kind = "cookie"
+            profile.auth.credential_name = name
+            profile.notes.append(f"detected cookie-session auth (cookie '{name}')")
+    return val
 
 
 def _whoami(http: HttpClient, profile: AppProfile, token: str) -> str | None:
@@ -88,14 +114,25 @@ def _whoami(http: HttpClient, profile: AppProfile, token: str) -> str | None:
     return None
 
 
+def _client(profile: AppProfile) -> HttpClient:
+    return HttpClient(profile.base_url, scheme=profile.auth.header_scheme,
+                      auth_kind=profile.auth.auth_kind,
+                      credential_name=profile.auth.credential_name)
+
+
 def bootstrap(profile: AppProfile, creds: list[Cred], *,
               make_attacker: bool = True) -> dict[str, Principal]:
-    http = HttpClient(profile.base_url, scheme=profile.auth.header_scheme)
+    http = _client(profile)
     principals: dict[str, Principal] = {}
 
     # 1. supplied privileged / role credentials
     for c in creds:
         tok = login(http, profile, c.identifier, c.password)
+        # login() may have auto-detected cookie/api-key auth — resync the client.
+        http.auth_kind, http.credential_name = profile.auth.auth_kind, profile.auth.credential_name
+        # API-key apps have no login flow: the supplied secret IS the key.
+        if not tok and profile.auth.auth_kind in ("apikey_header", "apikey_query", "basic"):
+            tok = c.password
         p = Principal(label=c.label, role=c.role, email=c.identifier,
                       username=c.identifier, password=c.password, token=tok, supplied=True)
         if tok:

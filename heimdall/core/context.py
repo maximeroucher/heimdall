@@ -19,7 +19,10 @@ class Context:
         self.profile = profile
         self.safe = safe
         self.verbose = verbose
-        self.http = HttpClient(profile.base_url, scheme=profile.auth.header_scheme)
+        self.http = HttpClient(
+            profile.base_url, scheme=profile.auth.header_scheme,
+            auth_kind=profile.auth.auth_kind,
+            credential_name=profile.auth.credential_name)
         self._findings: list[Finding] = []
         self._current_module = ""
 

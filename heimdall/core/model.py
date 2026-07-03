@@ -89,6 +89,10 @@ class AuthProfile:
     logout_path: str | None = None
     header_scheme: str = "Bearer"    # Authorization: <scheme> <token>
 
+    # How the credential is carried, so non-JWT/non-bearer apps work too.
+    auth_kind: str = "bearer"        # bearer | basic | apikey_header | apikey_query | cookie
+    credential_name: str = ""        # header / query / cookie name for apikey|cookie kinds
+
     # JWT facts, filled once we hold a real token.
     jwt_alg: str | None = None
     jwt_header: dict = field(default_factory=dict)

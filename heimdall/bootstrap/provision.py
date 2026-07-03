@@ -213,7 +213,9 @@ def _provision_via_db(profile: AppProfile, req: ProvisionRequest,
 
 def _login_principal(profile: AppProfile, ident: str, password: str, *,
                      label: str, role: str, user_id: str) -> Principal | None:
-    http = HttpClient(profile.base_url, scheme=profile.auth.header_scheme)
+    http = HttpClient(profile.base_url, scheme=profile.auth.header_scheme,
+                      auth_kind=profile.auth.auth_kind,
+                      credential_name=profile.auth.credential_name)
     tok = login(http, profile, ident, password)
     p = Principal(label=label, role=role, email=ident, username=ident.split("@")[0],
                   password=password, token=tok, user_id=user_id)

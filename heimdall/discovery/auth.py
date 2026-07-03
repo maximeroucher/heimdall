@@ -62,18 +62,35 @@ def _pick_field(fields: list[str], candidates: tuple[str, ...], default: str) ->
 def detect_auth(rm: RouteMap) -> AuthProfile:
     ap = AuthProfile()
 
-    # -- header scheme from securitySchemes ------------------------------------
+    # -- auth kind + header scheme from securitySchemes ------------------------
+    # Collect every declared scheme, then pick a primary: a token-in-Authorization
+    # scheme wins (most APIs' main path), else an API-key / cookie / basic scheme.
     schemes = (rm.components.get("securitySchemes") or {})
+    found: list[tuple[str, str]] = []   # (kind, credential_name)
     for s in schemes.values():
         if not isinstance(s, dict):
             continue
         t = s.get("type")
         if t == "http" and s.get("scheme", "").lower() == "bearer":
-            ap.header_scheme = "Bearer"
-        elif t == "oauth2":
-            ap.header_scheme = "Bearer"
+            found.append(("bearer", ""))
+        elif t == "http" and s.get("scheme", "").lower() == "basic":
+            found.append(("basic", ""))
+        elif t in ("oauth2", "openIdConnect"):
+            found.append(("bearer", ""))
         elif t == "apiKey":
-            ap.header_scheme = "Bearer"  # header name handled by caller if needed
+            loc, nm = s.get("in"), s.get("name", "")
+            if loc == "header":
+                found.append(("apikey_header", nm))
+            elif loc == "query":
+                found.append(("apikey_query", nm))
+            elif loc == "cookie":
+                found.append(("cookie", nm))
+    for pref in ("bearer", "apikey_header", "cookie", "apikey_query", "basic"):
+        match = next((f for f in found if f[0] == pref), None)
+        if match:
+            ap.auth_kind, ap.credential_name = match
+            break
+    ap.header_scheme = "Bearer"
 
     # -- login endpoint --------------------------------------------------------
     best, best_score = None, 0

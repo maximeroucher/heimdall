@@ -60,6 +60,8 @@ def summarize(profile: AppProfile) -> str:
         f"Base URL:  {profile.base_url}",
         f"Routes:    {len(profile.routes)} ({len(profile.routes.secured())} secured, "
         f"{len(profile.routes.with_path_params())} with path params)",
+        f"Auth:      {profile.auth.auth_kind}"
+        + (f" ({profile.auth.credential_name})" if profile.auth.credential_name else ""),
         f"Login:     {profile.auth.login_path or '—'} "
         f"[{profile.auth.login_style}]",
         f"Register:  {profile.auth.register_path or '—'}",
