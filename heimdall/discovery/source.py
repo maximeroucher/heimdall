@@ -110,6 +110,65 @@ def detect_db_url(source_path: str, secrets: list[Secret] | None = None) -> str 
     return None
 
 
+_CLIENTS_KEY = re.compile(r"^(auth_clients|oauth_clients|clients)\s*:\s*$", re.I)
+
+
+def oauth_clients(source_path: str) -> list[dict]:
+    """Best-effort extraction of registered OAuth clients (client_id + redirect
+    URIs + optional secret) from a config's ``AUTH_CLIENTS`` / ``clients`` mapping,
+    so the OIDC checks have a real client to drive ``/authorize`` with. Handles the
+    common YAML shape without a YAML dependency (indentation-aware)."""
+    root = Path(source_path)
+    if not root.exists():
+        return []
+    out: list[dict] = []
+    for fp in _iter_files(root, re.compile(r"\.ya?ml$")):
+        try:
+            out += _clients_from_yaml(fp.read_text(errors="ignore"))
+        except OSError:
+            continue
+    seen, res = set(), []
+    for c in out:
+        if c["client_id"] and c["client_id"] not in seen:
+            seen.add(c["client_id"])
+            res.append(c)
+    return res
+
+
+def _clients_from_yaml(text: str) -> list[dict]:
+    lines, out, i, n = text.splitlines(), [], 0, 0
+    n = len(lines)
+    while i < n:
+        if not _CLIENTS_KEY.match(lines[i].strip()):
+            i += 1
+            continue
+        block_indent = len(lines[i]) - len(lines[i].lstrip())
+        i += 1
+        child_indent, cur = None, None
+        while i < n:
+            ln = lines[i]
+            if not ln.strip():
+                i += 1
+                continue
+            ind = len(ln) - len(ln.lstrip())
+            if ind <= block_indent:
+                break
+            if child_indent is None:
+                child_indent = ind
+            s = ln.strip()
+            if ind == child_indent and s.endswith(":"):
+                cur = {"client_id": s[:-1].strip().strip("\"'"),
+                       "redirect_uris": [], "secret": None}
+                out.append(cur)
+            elif cur is not None and ind > child_indent:
+                if s.startswith("- "):
+                    cur["redirect_uris"].append(s[2:].strip().strip("\"'"))
+                elif s.lower().startswith("secret:"):
+                    cur["secret"] = s.split(":", 1)[1].strip().strip("\"'") or None
+            i += 1
+    return out
+
+
 def jwt_secret_candidates(secrets: list[Secret]) -> list[str]:
     """Ordered, de-duped list of plausible HS256 signing keys to try.
 
