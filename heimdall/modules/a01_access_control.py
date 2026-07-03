@@ -274,6 +274,9 @@ def _cross_principal_bola(ctx: Context) -> None:
                 "no rows for that resource."
             ),
             evidence=sample,
+            route=f"GET {hits[0][0].path}",
+            request=(f"GET {hits[0][0].fill_path({hits[0][0].path_params[0]: victim.user_id})}\n"
+                     f"Authorization: Bearer <{attacker.label} token>"),
             reproduction=(
                 f"Log in as user A ({attacker.email}), then GET "
                 f"{hits[0][0].path} substituting user B's id — returns 2xx instead of 403."
@@ -358,6 +361,10 @@ def _write_bola(ctx: Context) -> None:
                 "modify or delete other users' data."
             ),
             evidence=sample,
+            route=f"{strong[0][0].method} {strong[0][0].path}",
+            request=(f"{strong[0][0].method} "
+                     f"{strong[0][0].fill_path({strong[0][0].path_params[0]: victim.user_id})}\n"
+                     f"Authorization: Bearer <{attacker.label} token>"),
             reproduction=f"As user A, {strong[0][0].method} {strong[0][0].path} with user B's id.",
             references=[REFS["ps-idor"], REFS["A01"], REFS["cheat-authz"]],
             tools=["Burp Suite (Autorize)", "curl"],

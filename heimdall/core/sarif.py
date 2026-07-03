@@ -41,27 +41,42 @@ def to_sarif(findings, meta: dict) -> dict:
     results = []
     for f in findings:
         text = f.summary
+        if f.route:
+            text += f"\n\nRoute: {f.route}"
+        if f.request:
+            text += "\n\nTriggering request:\n" + f.request.strip()
         if f.evidence:
             text += "\n\nEvidence:\n" + f.evidence.strip()
         if f.reproduction:
             text += "\n\nReproduction:\n" + f.reproduction.strip()
+
+        # A source file:line -> a physicalLocation so GitHub annotates the handler.
+        loc = {"logicalLocations": [{
+            "name": f.route or meta.get("base_url", "target"),
+            "kind": "resource",
+        }]}
+        if f.location and ":" in f.location:
+            fpath, _, line = f.location.rpartition(":")
+            region = {}
+            if line.isdigit():
+                region = {"region": {"startLine": int(line)}}
+            loc["physicalLocation"] = {
+                "artifactLocation": {"uri": fpath},
+                **region,
+            }
         results.append({
             "ruleId": f.id,
             "level": _LEVEL[f.severity],
             "kind": "pass" if f.severity == "SAFE" else "fail",
             "message": {"text": text},
-            "locations": [{
-                "logicalLocations": [{
-                    "name": meta.get("base_url", "target"),
-                    "kind": "resource",
-                }],
-            }],
+            "locations": [loc],
             "partialFingerprints": {"heimdallFindingId/v1": f.id},
             "properties": {
                 "severity": f.severity,
                 "owasp": f.owasp,
                 "cvss": CVSS_BAND[f.severity],
                 "module": f.module,
+                "route": f.route,
             },
         })
 

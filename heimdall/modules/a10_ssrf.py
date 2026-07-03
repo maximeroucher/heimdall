@@ -351,6 +351,9 @@ def _report(ctx: Context, sinks: list[tuple], confirmed: list[dict]) -> None:
                 "and impact with an out-of-band (OAST) collaborator."
             ),
             evidence="\n".join(evid_lines),
+            route=f"{r.method} {r.path}",
+            request=(f"{r.method} {r.path}  ({lead['location']} '{lead['name']}' = "
+                     f"{lead['payload']})"),
             reproduction=(
                 f"Send {r.method} {r.path} with {lead['location']} field "
                 f"'{lead['name']}' = {lead['payload']} (compare against "

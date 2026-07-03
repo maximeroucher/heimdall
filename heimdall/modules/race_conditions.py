@@ -90,6 +90,9 @@ def run(ctx: Context) -> None:
                 "constraints, not read-then-write."
             ),
             evidence=sample,
+            route=f"{raced[0][0].method} {raced[0][0].path}",
+            request=f"{_BURST}x concurrent  {raced[0][0].method} {raced[0][0].path}  "
+                    "(barrier-aligned burst)",
             reproduction=f"Send ~{_BURST} concurrent identical {raced[0][0].method} "
                          f"{raced[0][0].path} requests (Burp Turbo Intruder / single-packet).",
             references=["https://owasp.org/Top10/A04_2021-Insecure_Design/",

@@ -123,6 +123,7 @@ def run(
                 ctx.note(f"module {spec.key} crashed mid-run (partial results)")
 
         findings = ctx.findings()
+        _resolve_source_locations(config.source_path, findings)
         out_dir = out_dir or os.path.join(os.getcwd(), "heimdall-report")
         meta = {
             "app_name": profile.app_name,
@@ -141,6 +142,24 @@ def run(
             proc.terminate()
         if testdb is not None:
             testdb.remove()
+
+
+def _resolve_source_locations(source_path, findings) -> None:
+    """Fill each finding's `location` (file:line) by mapping its route back to the
+    handler in the source tree — so the report points at the exact code to fix."""
+    if not source_path:
+        return
+    from .discovery.source import index_routes, locate_route
+    index = index_routes(source_path)
+    if not index:
+        return
+    for f in findings:
+        if f.location or not f.route or " " not in f.route:
+            continue
+        method, _, path = f.route.partition(" ")
+        loc = locate_route(index, method.strip(), path.strip())
+        if loc:
+            f.location = loc
 
 
 def _provision(config, profile, principals: dict, db_url: str | None) -> None:

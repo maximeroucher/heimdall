@@ -163,6 +163,42 @@ def find_app_target(source_path: str) -> str | None:
     return candidates[0][1] if candidates else None
 
 
+_ROUTE_DECORATOR = re.compile(
+    r"""\.(get|post|put|patch|delete)\(\s*["']([^"'\n]+)["']""", re.I)
+
+
+def index_routes(source_path: str) -> list[tuple[str, str, str]]:
+    """Map route decorators to source. Returns [(METHOD, path, 'file:line'), …]
+    by scanning FastAPI ``@router.post("/x")`` style decorators (multi-line ok)."""
+    root = Path(source_path)
+    if not root.exists():
+        return []
+    out: list[tuple[str, str, str]] = []
+    for fp in _iter_files(root, re.compile(r"endpoints.*\.py$|routes?\.py$|.*_api\.py$|app\.py$")):
+        try:
+            text = fp.read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _ROUTE_DECORATOR.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            method, path = m.group(1).upper(), m.group(2)
+            out.append((method, path, f"{fp.relative_to(root)}:{line}"))
+    return out
+
+
+def locate_route(index: list[tuple[str, str, str]], method: str, path: str) -> str | None:
+    """Find the source location for an (method, openapi-path). Exact match first,
+    then a suffix match (routers mounted under a prefix)."""
+    method = method.upper()
+    for m, p, loc in index:
+        if m == method and p == path:
+            return loc
+    for m, p, loc in index:
+        if m == method and path.endswith(p) and p.count("/") >= 2:
+            return loc
+    return None
+
+
 def read_stack(source_path: str) -> dict[str, str]:
     """Parse pinned dependency versions from requirements*.txt / pyproject.toml."""
     root = Path(source_path)

@@ -31,6 +31,9 @@ class Finding:
     references: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)   # public tools for this class
     module: str = ""                 # which module produced it (filled by runner)
+    route: str = ""                  # affected endpoint, e.g. "POST /tickets/{id}/scan"
+    request: str = ""                # concrete request that triggers it (curl / method+path+body)
+    location: str = ""               # source file:line of the handler (filled if --source)
 
     def __post_init__(self) -> None:
         if self.severity not in SEVERITIES:
@@ -114,8 +117,16 @@ def _render_md(findings: list[Finding], meta: dict) -> str:
         L.append(f"- **OWASP:** {OWASP_2021[f.owasp]}")
         if f.severity != "SAFE":
             L.append(f"- **Severity:** {f.severity} (indicative CVSS {CVSS_BAND[f.severity]})")
-        L.append(f"- **ID:** `{f.id}`" + (f" · **module:** `{f.module}`" if f.module else "") + "\n")
+        L.append(f"- **ID:** `{f.id}`" + (f" · **module:** `{f.module}`" if f.module else ""))
+        if f.route:
+            L.append(f"- **Route:** `{f.route}`")
+        if f.location:
+            L.append(f"- **Source:** `{f.location}`")
+        L.append("")
         L.append(f"{f.summary}\n")
+        if f.request:
+            L.append("**Triggering request:**\n")
+            L.append("```http\n" + f.request.strip() + "\n```\n")
         if f.evidence:
             L.append("**Evidence / PoC output:**\n")
             L.append("```\n" + f.evidence.strip() + "\n```\n")
@@ -223,7 +234,16 @@ def _render_html(findings: list[Finding], meta: dict) -> str:
                  + (f" · module <code>{_esc(f.module)}</code>" if f.module else "")
                  + (f" · indicative CVSS {CVSS_BAND[f.severity]}" if f.severity != "SAFE" else "")
                  + "</p>")
+        if f.route or f.location:
+            bits = []
+            if f.route:
+                bits.append(f"Route: <code>{_esc(f.route)}</code>")
+            if f.location:
+                bits.append(f"Source: <code>{_esc(f.location)}</code>")
+            H.append('<p class="meta">' + " · ".join(bits) + "</p>")
         H.append(f"<p>{_esc(f.summary)}</p>")
+        if f.request:
+            H.append(f"<b>Triggering request</b><pre>{_esc(f.request.strip())}</pre>")
         if f.evidence:
             H.append(f"<b>Evidence / PoC</b><pre>{_esc(f.evidence.strip())}</pre>")
         if f.reproduction:
