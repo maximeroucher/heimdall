@@ -19,7 +19,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..core.context import Context
 from ..core.http import HttpClient
-from .base import looks_like_id_param, module
+from ..core.reqbuild import build_request
+from .base import module
 
 _ONCE_HINTS = (
     "claim", "redeem", "redemption", "coupon", "voucher", "promo", "apply",
@@ -55,17 +56,10 @@ def run(ctx: Context) -> None:
     raced = []
     tested = 0
     for r in candidates[:25]:
-        val = None
-        if r.path_params:
-            pname = r.path_params[0]
-            if princ and princ.user_id and looks_like_id_param(pname) and "user" in pname.lower():
-                val = princ.user_id
-            else:
-                # A real object id (from a sibling list endpoint) is needed to
-                # reach the operation — a fake id just 404s and gets skipped.
-                val = _harvest_id(ctx, r, pname, token) or "heimdall-race-1"
-        path = r.fill_path({r.path_params[0]: val}) if r.path_params else r.path
-        result = _probe(ctx, r.method, path, token)
+        # Build a VALID request (real path/FK ids from related endpoints + typed
+        # body) so the burst reaches the handler instead of 404/422-ing.
+        path, body = build_request(ctx, r, token, principal=princ)
+        result = _probe(ctx, r.method, path, token, body)
         if result is None:
             continue
         tested += 1
@@ -102,45 +96,11 @@ def run(ctx: Context) -> None:
         )
 
 
-def _harvest_id(ctx: Context, route, pname: str, token: str | None) -> str | None:
-    """Fetch a real value for a path param from a sibling GET list endpoint.
-
-    e.g. to race POST /tombola/tickets/buy/{pack_id}, pull a pack id from
-    GET /tombola/pack_tickets. Matches by the param's resource word and shared
-    path segments, so the race probe reaches the operation instead of 404ing.
-    """
-    resource = pname.lower().replace("_id", "").replace("id", "").strip("_")
-    segs = [s for s in route.path.lower().split("/") if s and "{" not in s]
-    lists = [r for r in ctx.routes.by_method("GET")
-             if not r.has_path_param
-             and (resource and resource in r.path.lower()
-                  or any(s in r.path.lower() for s in segs))]
-    # prefer the most specific (longest shared) path
-    lists.sort(key=lambda r: -len(set(r.path.lower().split("/")) & set(segs)))
-    for lr in lists[:5]:
-        try:
-            resp = ctx.get(lr.path, token=token)
-        except Exception:  # noqa: BLE001
-            continue
-        if resp.status_code >= 300:
-            continue
-        try:
-            data = resp.json()
-        except ValueError:
-            continue
-        items = data.get("items", data) if isinstance(data, dict) else data
-        if isinstance(items, list):
-            for it in items:
-                if isinstance(it, dict) and it.get("id"):
-                    return str(it["id"])
-    return None
-
-
-def _probe(ctx: Context, method: str, path: str, token: str | None):
+def _probe(ctx: Context, method: str, path: str, token: str | None, body: dict):
     """Return (concurrent_successes, sequential_successes_after) or None to skip.
 
-    Skips endpoints where even a single call doesn't clearly succeed (they need a
-    body we can't synthesise), so we don't misread validation errors as races.
+    Skips endpoints where even a single call doesn't clearly succeed (a body we
+    couldn't synthesise validly), so we don't misread validation errors as races.
     """
     base = ctx.base_url
     kind = ctx.auth.auth_kind
@@ -150,7 +110,7 @@ def _probe(ctx: Context, method: str, path: str, token: str | None):
         cli = HttpClient(base, scheme=ctx.auth.header_scheme, auth_kind=kind,
                          credential_name=name, timeout=15)
         try:
-            return cli.req(method, path, token=token, json={}, retry_429=False).status_code
+            return cli.req(method, path, token=token, json=body, retry_429=False).status_code
         except Exception:  # noqa: BLE001
             return 0
 
