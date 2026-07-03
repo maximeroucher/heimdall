@@ -195,6 +195,56 @@ def index_routes(source_path: str) -> list[tuple[str, str, str]]:
     return out
 
 
+_WS_DECORATOR = re.compile(r"""\.websocket\(\s*["']([^"'\n]+)["']""", re.I)
+_WS_ADD_ROUTE = re.compile(
+    r"""\.add_(?:api_)?websocket_route\(\s*["']([^"'\n]+)["']""", re.I)
+# router mounted with a prefix: include_router(x.router, prefix="/api")
+_INCLUDE_PREFIX = re.compile(
+    r"""include_router\([^)]*?prefix\s*=\s*["']([^"'\n]+)["']""", re.I | re.S)
+
+
+def index_websocket_routes(source_path: str) -> list[tuple[str, str]]:
+    """Find WebSocket endpoints — which OpenAPI never lists, so they're invisible
+    to black-box discovery. Scans ``@app.websocket("/x")`` / ``@router.websocket``
+    / ``add_websocket_route`` decorators. Returns [(path, 'file:line'), …].
+
+    Router prefixes can't be resolved perfectly statically, so we return the
+    decorator-declared path and, when the file mounts routers under a prefix, the
+    prefixed variants too — the tester tries each and keeps whatever the server
+    actually accepts."""
+    root = Path(source_path)
+    if not root.exists():
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for fp in _iter_files(root, re.compile(r"\.py$")):
+        try:
+            text = fp.read_text(errors="ignore")
+        except OSError:
+            continue
+        if ".websocket(" not in text and "websocket_route" not in text:
+            continue
+        prefixes = [m.group(1) for m in _INCLUDE_PREFIX.finditer(text)]
+        for pat in (_WS_DECORATOR, _WS_ADD_ROUTE):
+            for m in pat.finditer(text):
+                line = text.count("\n", 0, m.start()) + 1
+                loc = f"{fp.relative_to(root)}:{line}"
+                for candidate in _ws_path_variants(m.group(1), prefixes):
+                    if candidate not in seen:
+                        seen.add(candidate)
+                        out.append((candidate, loc))
+    return out
+
+
+def _ws_path_variants(path: str, prefixes: list[str]) -> list[str]:
+    variants = [path]
+    for pre in prefixes:
+        combined = pre.rstrip("/") + "/" + path.lstrip("/")
+        if combined not in variants:
+            variants.append(combined)
+    return variants
+
+
 def locate_route(index: list[tuple[str, str, str]], method: str, path: str) -> str | None:
     """Find the source location for an (method, openapi-path). Exact match first,
     then a suffix match (routers mounted under a prefix)."""

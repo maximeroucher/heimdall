@@ -124,3 +124,21 @@ def test_jwt_secret_candidates_includes_source_and_wordlist():
     cands = source.jwt_secret_candidates([Secret("K", "azerty", "x", "jwt_secret")])
     assert cands[0] == "azerty"        # source value tried first
     assert "secret" in cands           # built-in wordlist appended
+
+
+def test_index_websocket_routes_finds_decorators_and_prefixes(tmp_path):
+    mod = tmp_path / "endpoints.py"
+    mod.write_text(
+        "router = APIRouter()\n"
+        '@router.websocket("/cdr/users/ws")\n'
+        "async def ws_endpoint(ws): ...\n"
+        '@app.websocket("/live")\n'
+        "async def live(ws): ...\n"
+        'app.add_websocket_route("/added/ws", handler)\n'
+        'app.include_router(router, prefix="/api")\n'
+    )
+    routes = source.index_websocket_routes(str(tmp_path))
+    paths = {p for p, _loc in routes}
+    assert {"/cdr/users/ws", "/live", "/added/ws"} <= paths   # raw decorator paths
+    assert "/api/cdr/users/ws" in paths                        # prefixed variant too
+    assert all(":" in loc for _p, loc in routes)               # each has file:line
