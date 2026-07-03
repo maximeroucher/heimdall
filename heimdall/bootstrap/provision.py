@@ -141,13 +141,37 @@ def _provision_via_db(profile: AppProfile, req: ProvisionRequest,
         except Exception:  # noqa: BLE001 — FK constraints may block deletes; ignore
             pass
 
+        # Pick a REPRESENTATIVE template, not just the first row: cloning a
+        # random non-admin can land on an atypical account (e.g. an 'external'
+        # user the app blocks from most routes), which silently skews auth
+        # results. We clone the row whose email domain is the most common among
+        # non-admins — the "typical" user — so provisioning is deterministic.
+        flag = roles["admin"]
+        email_col = roles["email"]
+
+        def _modal_domain(want_admin: bool) -> str | None:
+            where = f' WHERE "{flag}" = {1 if want_admin else 0}' if flag else ""
+            rows = conn.execute(
+                text(f'SELECT "{email_col}" FROM "{table}"{where}')).scalars().all()
+            doms: dict[str, int] = {}
+            for e in rows:
+                d = str(e).split("@")[-1] if e and "@" in str(e) else ""
+                if d:
+                    doms[d] = doms.get(d, 0) + 1
+            return max(doms, key=doms.get) if doms else None
+
         def template(want_admin: bool):
-            flag = roles["admin"]
-            order = ""
-            if flag:
-                order = f' WHERE "{flag}" = {1 if want_admin else 0}'
-            row = conn.execute(
-                text(f'SELECT * FROM "{table}"{order} LIMIT 1')).mappings().first()
+            where = f' WHERE "{flag}" = {1 if want_admin else 0}' if flag else ""
+            dom = _modal_domain(want_admin)
+            row = None
+            if dom:
+                row = conn.execute(
+                    text(f'SELECT * FROM "{table}"{where}'
+                         f'{" AND" if where else " WHERE"} "{email_col}" LIKE :d LIMIT 1'),
+                    {"d": f"%@{dom}"}).mappings().first()
+            if row is None:
+                row = conn.execute(
+                    text(f'SELECT * FROM "{table}"{where} LIMIT 1')).mappings().first()
             if row is None:
                 row = conn.execute(text(f'SELECT * FROM "{table}" LIMIT 1')).mappings().first()
             if row is None:

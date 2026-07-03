@@ -91,6 +91,9 @@ def run(
         if config.provision_low_priv or config.provision_admins:
             _provision(config, profile, principals, db_url)
 
+        if config.mint_scoped:
+            _mint_scoped_tokens(profile, principals)
+
         authed = [k for k, p in principals.items() if p.authed]
         print(f"[*] authenticated principals: {authed or 'none'}")
 
@@ -141,10 +144,7 @@ def run(
 
 
 def _provision(config, profile, principals: dict, db_url: str | None) -> None:
-    """Insert low-priv / admin test users into the throwaway DB and, when a
-    signing secret is recoverable, mint them API-scoped tokens so they can
-    actually exercise the authenticated API."""
-    from .bootstrap import minting
+    """Insert low-priv / admin test users into the throwaway DB Heimdall owns."""
     from .bootstrap.provision import ProvisionRequest, provision
 
     req = ProvisionRequest(
@@ -157,23 +157,36 @@ def _provision(config, profile, principals: dict, db_url: str | None) -> None:
     res = provision(profile, req)
     for n in res.notes:
         print(f"      · {n}")
-
-    secret = None
-    scopes = ""
-    if config.mint_scoped:
-        template = next((p.token for p in principals.values() if p.token), None) \
-            or next((p.token for p in res.principals if p.token), None)
-        if template:
-            secret = minting.recover_secret(profile, template)
-            scopes = minting.declared_scopes(profile)
-            if secret:
-                print(f"[*] signing secret recovered → minting {scopes or 'default'}-scoped "
-                      "tokens for provisioned users")
-
     for p in res.principals:
-        if secret and p.token and scopes:
-            minted = minting.mint(p.token, secret, sub=p.user_id, scopes=scopes)
-            if minted:
-                p.token = minted
-                p.extra["minted_scopes"] = scopes
         principals[p.label] = p
+
+
+def _mint_scoped_tokens(profile, principals: dict) -> None:
+    """When the signing secret is recoverable, re-issue EVERY principal an
+    API-scoped token. Needed on apps whose login tokens are scope-limited (e.g.
+    the app's 'auth'-scoped simple_token that 403s the whole API) — this lifts
+    supplied admins AND provisioned users to a usable scope so the authorization
+    matrix (BFLA both directions, BOLA) can actually be exercised."""
+    from .bootstrap import minting
+
+    template = next((p.token for p in principals.values() if p.token), None)
+    if not template:
+        return
+    secret = minting.recover_secret(profile, template)
+    if not secret:
+        return
+    scopes = minting.declared_scopes(profile)
+    if not scopes:
+        return
+    n = 0
+    for p in principals.values():
+        if not p.token:
+            continue
+        minted = minting.mint(p.token, secret, sub=p.user_id, scopes=scopes)
+        if minted:
+            p.token = minted
+            p.extra["minted_scopes"] = scopes
+            n += 1
+    if n:
+        print(f"[*] signing secret recovered → minted {scopes!r}-scoped tokens "
+              f"for {n} principal(s)")

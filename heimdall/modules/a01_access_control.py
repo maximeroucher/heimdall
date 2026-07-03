@@ -40,6 +40,8 @@ def run(ctx: Context) -> None:
     _bfla_admin(ctx)
     _idor(ctx)
     _cross_principal_bola(ctx)
+    _write_bola(ctx)
+    _self_escalation(ctx)
 
 
 def _unauth_enforcement(ctx: Context) -> None:
@@ -124,16 +126,38 @@ def _bfla_admin(ctx: Context) -> None:
             tools=["Burp Suite (Authorize/AuthMatrix)", "curl"],
         )
     elif admin_routes:
-        caveat = "" if trustworthy else (
-            f" NOTE: tested with the supplied principal '{attacker.label}', whose "
-            "privilege level is unverified — re-run with a known low-privilege account "
-            "to make this negative authoritative."
-        )
+        # Positive control: a real admin SHOULD reach these routes. If it does,
+        # the negative result is authoritative (routes are genuinely admin-gated,
+        # not merely broken/unreachable for everyone).
+        admin = _admin_principal(ctx)
+        admin_ok = 0
+        if admin:
+            for r in admin_routes:
+                try:
+                    if ctx.get(r.path, token=admin.token).status_code < 300:
+                        admin_ok += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        if admin and admin_ok:
+            summary = (f"All {len(admin_routes)} admin-looking GET routes denied "
+                       f"'{attacker.label}', while admin '{admin.label}' reached "
+                       f"{admin_ok}/{len(admin_routes)} — authoritative: the routes are "
+                       "admin-gated and enforce it.")
+        elif admin:
+            summary = (f"All {len(admin_routes)} admin-looking GET routes denied "
+                       f"'{attacker.label}', but admin '{admin.label}' also could not reach "
+                       "any — these routes may need higher privilege or aren't reachable; "
+                       "result is not authoritative.")
+        else:
+            caveat = "" if trustworthy else (
+                " NOTE: tested with a supplied principal of unverified privilege.")
+            summary = (f"All {len(admin_routes)} admin-looking GET routes denied the token "
+                       "(no admin principal available for a positive control)." + caveat)
         ctx.finding(
             id="a01-bfla-admin-routes",
             owasp="A01", severity="SAFE",
             title="Admin-scoped routes reject the tested low-privilege token",
-            summary=f"All {len(admin_routes)} admin-looking GET routes denied the token." + caveat,
+            summary=summary,
         )
 
 
@@ -263,4 +287,189 @@ def _cross_principal_bola(ctx: Context) -> None:
             title="Object-by-id routes enforce ownership across users",
             summary=f"Using two distinct low-priv accounts, no single-id GET route let "
                     f"'{attacker.label}' read '{victim.label}''s objects while rejecting bogus ids.",
+        )
+
+
+def _admin_principal(ctx: Context):
+    for role in ("admin", "super_admin", "superuser"):
+        p = ctx.principal(role)
+        if p and p.authed:
+            return p
+    return None
+
+
+# ── Write-side BOLA: modify/delete another user's object ──────────────────────
+
+_BOGUS_ID = "00000000-0000-0000-0000-0000000000ff"
+
+
+def _write_bola(ctx: Context) -> None:
+    """Cross-principal PATCH/PUT/DELETE: can attacker A mutate victim B's object?
+    Higher impact than a read BOLA. Destructive, so FULL mode only. Uses B's
+    known id; a non-403 where a bogus id is rejected shows the ownership check
+    is missing on the write path.
+    """
+    if ctx.safe:
+        ctx.note("safe mode: skipping cross-principal write (PATCH/DELETE) BOLA")
+        return
+    pair = _lowpriv_pair(ctx)
+    if not pair:
+        return
+    attacker, victim = pair
+    routes = [r for r in ctx.routes
+              if r.method in ("PATCH", "PUT", "DELETE") and len(r.path_params) == 1
+              and looks_like_id_param(r.path_params[0])]
+    strong, weak = [], []
+    for r in routes[:60]:
+        pname = r.path_params[0]
+        body = None if r.method == "DELETE" else {}
+        try:
+            vic = ctx.request(r.method, r.fill_path({pname: victim.user_id}),
+                              token=attacker.token, json=body)
+            bog = ctx.request(r.method, r.fill_path({pname: _BOGUS_ID}),
+                              token=attacker.token, json=body)
+        except Exception as exc:  # noqa: BLE001
+            ctx.note(f"write-BOLA probe of {r.method} {r.path} errored: {exc}")
+            continue
+        if vic.status_code in (401, 403):
+            continue  # properly denied
+        # victim reached the handler while a bogus id is rejected as not-found.
+        if bog.status_code in (401, 403, 404) and vic.status_code not in (404,):
+            if vic.status_code < 300:
+                strong.append((r, vic.status_code))
+            else:
+                weak.append((r, vic.status_code))
+    if strong:
+        sample = "\n".join(f"  {r.method} {r.path} [victim id] -> {c} (succeeded)"
+                           for r, c in strong[:15])
+        ctx.finding(
+            id="a01-write-bola", owasp="A01", severity="HIGH",
+            title=f"Write BOLA: low-priv user mutates other users' objects on "
+                  f"{len(strong)} route(s)",
+            summary=(
+                f"As '{attacker.label}', Heimdall issued a PATCH/PUT/DELETE against "
+                f"'{victim.label}''s object by id and it SUCCEEDED (2xx), while a bogus id is "
+                "rejected — the write path performs no ownership check. An attacker can "
+                "modify or delete other users' data."
+            ),
+            evidence=sample,
+            reproduction=f"As user A, {strong[0][0].method} {strong[0][0].path} with user B's id.",
+            references=[REFS["ps-idor"], REFS["A01"], REFS["cheat-authz"]],
+            tools=["Burp Suite (Autorize)", "curl"],
+        )
+    elif weak:
+        sample = "\n".join(f"  {r.method} {r.path} [victim id] -> {c} (reached handler)"
+                           for r, c in weak[:15])
+        ctx.finding(
+            id="a01-write-bola", owasp="A01", severity="MEDIUM",
+            title=f"Possible write BOLA on {len(weak)} route(s) (reached handler cross-user)",
+            summary=(
+                f"'{attacker.label}''s PATCH/PUT/DELETE on '{victim.label}''s object was not "
+                "denied (no 401/403) — it reached handler logic and failed later (validation/"
+                "conflict) rather than on ownership. Confirm with a valid body whether the "
+                "mutation actually lands."
+            ),
+            evidence=sample,
+            references=[REFS["ps-idor"], REFS["A01"]],
+            tools=["Burp Suite (Autorize)", "curl"],
+        )
+    else:
+        ctx.finding(
+            id="a01-write-bola", owasp="A01", severity="SAFE",
+            title="Write routes enforce ownership across users",
+            summary=f"No user-keyed PATCH/PUT/DELETE let '{attacker.label}' operate on "
+                    f"'{victim.label}''s object.",
+        )
+
+
+# ── Self privilege-escalation via mass assignment on a self-update route ───────
+
+_PRIV_FIELDS = {
+    "is_admin": True, "is_superuser": True, "is_super_admin": True, "admin": True,
+    "is_staff": True, "is_moderator": True, "role": "admin", "roles": ["admin"],
+    "scopes": "API", "scope": "API", "validated": True, "is_active": True,
+    "is_verified": True, "verified": True, "account_type": "admin", "group": "admin",
+}
+
+
+def _reflects(obj, key, val) -> bool:
+    if isinstance(obj, dict):
+        if key in obj and _val_match(obj[key], val):
+            return True
+        return any(_reflects(v, key, val) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_reflects(x, key, val) for x in obj)
+    return False
+
+
+def _val_match(got, want) -> bool:
+    if isinstance(want, bool):
+        return got is True
+    if isinstance(want, list):
+        return isinstance(got, list) and any(str(w).lower() in
+               [str(g).lower() for g in got] for w in want)
+    return str(got).lower() == str(want).lower()
+
+
+def _self_escalation(ctx: Context) -> None:
+    """Mass assignment on self: submit privileged fields to a self-update route
+    (…/me PATCH/PUT) and confirm — by diffing a re-fetch — that a field flipped
+    to our value. Catches 'user promotes self to admin / self-validates'.
+    """
+    if ctx.safe:
+        ctx.note("safe mode: skipping self privilege-escalation probe")
+        return
+    princ = ctx.principal("attacker", "user")
+    if not princ or not princ.authed:
+        return
+    routes = [r for r in ctx.routes
+              if r.method in ("PATCH", "PUT") and not r.has_path_param
+              and _is_self_scoped(r.path)]
+    hits = []
+    for r in routes[:30]:
+        try:
+            before = ctx.get(r.path, token=princ.token)
+            before_json = before.json() if before.status_code < 300 else {}
+            # only inject fields that aren't ALREADY at our target value
+            payload = {k: v for k, v in _PRIV_FIELDS.items()
+                       if not _reflects(before_json, k, v)}
+            if not payload:
+                continue
+            resp = ctx.request(r.method, r.path, token=princ.token, json=payload)
+            if resp.status_code >= 300:
+                continue
+            after = ctx.get(r.path, token=princ.token)
+            after_json = after.json() if after.status_code < 300 else {}
+        except Exception as exc:  # noqa: BLE001
+            ctx.note(f"self-escalation probe of {r.method} {r.path} errored: {exc}")
+            continue
+        stuck = [k for k, v in payload.items() if _reflects(after_json, k, v)]
+        if stuck:
+            hits.append((r, stuck))
+    if hits:
+        sample = "\n".join(f"  {r.method} {r.path} accepted privileged field(s): {stuck}"
+                           for r, stuck in hits[:15])
+        ctx.finding(
+            id="a01-self-escalation", owasp="A01", severity="HIGH",
+            title=f"Privilege escalation via self-update mass assignment on "
+                  f"{len(hits)} route(s)",
+            summary=(
+                f"A low-privilege user ('{princ.label}') PATCHed its own record with "
+                "privileged fields it should not control (e.g. is_admin / role / validated / "
+                "account_type) and a re-fetch confirms the value CHANGED. The self-update "
+                "endpoint mass-assigns attacker-controlled fields — direct privilege "
+                "escalation."
+            ),
+            evidence=sample,
+            reproduction=f"As a normal user, {hits[0][0].method} {hits[0][0].path} with "
+                         f"{{{hits[0][1][0]!r}: <privileged value>}} in the body, then re-read.",
+            references=[REFS["ps-massassign"], REFS["A01"], REFS["cheat-authz"]],
+            tools=["Burp Suite", "curl"],
+        )
+    elif routes:
+        ctx.finding(
+            id="a01-self-escalation", owasp="A01", severity="SAFE",
+            title="Self-update routes ignore injected privileged fields",
+            summary=f"Injecting admin/role/validated fields into {len(routes)} self-update "
+                    "route(s) did not change any privileged attribute (mass assignment blocked).",
         )
