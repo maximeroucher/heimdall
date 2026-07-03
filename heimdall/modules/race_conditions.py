@@ -58,8 +58,12 @@ def run(ctx: Context) -> None:
         val = None
         if r.path_params:
             pname = r.path_params[0]
-            val = (princ.user_id if princ and looks_like_id_param(pname) and "user" in pname.lower()
-                   else "heimdall-race-1")
+            if princ and princ.user_id and looks_like_id_param(pname) and "user" in pname.lower():
+                val = princ.user_id
+            else:
+                # A real object id (from a sibling list endpoint) is needed to
+                # reach the operation — a fake id just 404s and gets skipped.
+                val = _harvest_id(ctx, r, pname, token) or "heimdall-race-1"
         path = r.fill_path({r.path_params[0]: val}) if r.path_params else r.path
         result = _probe(ctx, r.method, path, token)
         if result is None:
@@ -96,6 +100,40 @@ def run(ctx: Context) -> None:
             summary=f"Fired {_BURST} concurrent requests at {tested} one-shot-looking "
                     "endpoint(s); none allowed more than a single success — guards look atomic.",
         )
+
+
+def _harvest_id(ctx: Context, route, pname: str, token: str | None) -> str | None:
+    """Fetch a real value for a path param from a sibling GET list endpoint.
+
+    e.g. to race POST /tombola/tickets/buy/{pack_id}, pull a pack id from
+    GET /tombola/pack_tickets. Matches by the param's resource word and shared
+    path segments, so the race probe reaches the operation instead of 404ing.
+    """
+    resource = pname.lower().replace("_id", "").replace("id", "").strip("_")
+    segs = [s for s in route.path.lower().split("/") if s and "{" not in s]
+    lists = [r for r in ctx.routes.by_method("GET")
+             if not r.has_path_param
+             and (resource and resource in r.path.lower()
+                  or any(s in r.path.lower() for s in segs))]
+    # prefer the most specific (longest shared) path
+    lists.sort(key=lambda r: -len(set(r.path.lower().split("/")) & set(segs)))
+    for lr in lists[:5]:
+        try:
+            resp = ctx.get(lr.path, token=token)
+        except Exception:  # noqa: BLE001
+            continue
+        if resp.status_code >= 300:
+            continue
+        try:
+            data = resp.json()
+        except ValueError:
+            continue
+        items = data.get("items", data) if isinstance(data, dict) else data
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("id"):
+                    return str(it["id"])
+    return None
 
 
 def _probe(ctx: Context, method: str, path: str, token: str | None):
