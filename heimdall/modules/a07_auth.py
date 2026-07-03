@@ -50,14 +50,18 @@ def _next_suffix(ctx: Context) -> int:
 
 
 def _login_attempt(ctx: Context, ident: str, pw: str, *, headers: dict | None = None):
-    """Fire one login honoring ``ctx.auth.login_style``; returns the Response."""
+    """Fire one login honoring ``ctx.auth.login_style``; returns the Response.
+
+    ``retry_429=False``: this module must *observe* raw 429s to decide whether a
+    rate limiter exists, so it opts out of the client's transparent back-off.
+    """
     a = ctx.auth
     body = {a.username_field: ident, a.password_field: pw}
     if a.login_style in ("form", "oauth_password"):
         if a.login_style == "oauth_password":
             body["grant_type"] = "password"
-        return ctx.post(a.login_path, data=body, headers=headers)
-    return ctx.post(a.login_path, json=body, headers=headers)
+        return ctx.post(a.login_path, data=body, headers=headers, retry_429=False)
+    return ctx.post(a.login_path, json=body, headers=headers, retry_429=False)
 
 
 @module("a07", "Authentication Failures")

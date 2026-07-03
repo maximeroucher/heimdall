@@ -73,6 +73,7 @@ def _cors(ctx: Context) -> None:
     path = _probe_path(ctx)
     rand_origin = f"https://{uuid.uuid4().hex[:12]}.attacker.example"
     findings_made = False
+    rate_limited = False
 
     for origin in (_EVIL_ORIGIN, rand_origin):
         try:
@@ -81,6 +82,9 @@ def _cors(ctx: Context) -> None:
             ctx.note(f"CORS probe of {path} with origin {origin} failed: {exc}")
             continue
 
+        if resp.status_code == 429:
+            rate_limited = True
+            continue
         acao = resp.headers.get("Access-Control-Allow-Origin")
         acac = (resp.headers.get("Access-Control-Allow-Credentials") or "").strip().lower()
         creds = acac == "true"
@@ -190,7 +194,18 @@ def _cors(ctx: Context) -> None:
     except Exception as exc:  # noqa: BLE001
         ctx.note(f"CORS preflight OPTIONS {path} failed: {exc}")
 
-    if not findings_made:
+    if not findings_made and rate_limited:
+        ctx.finding(
+            id="a05-cors-reflected",
+            owasp="A05", severity="INFO",
+            title="CORS check inconclusive — target rate-limited the probe (429)",
+            summary=(
+                "The CORS probes were answered with HTTP 429 even after back-off, so "
+                "reflection could not be determined. Re-run this check in isolation "
+                "(`--only a05`) or after the rate-limit window resets."
+            ),
+        )
+    elif not findings_made:
         ctx.finding(
             id="a05-cors-reflected",
             owasp="A05", severity="SAFE",

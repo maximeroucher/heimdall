@@ -1,10 +1,20 @@
-"""Thin ``requests`` wrapper: base-url joining + flexible Authorization."""
+"""Thin ``requests`` wrapper: base-url joining + flexible Authorization.
+
+Transparently backs off on ``429 Too Many Requests`` so the target's own rate
+limiter can't poison later probes (a 429 must never be misread as "secure").
+Callers that specifically want to *observe* raw 429s — the a07 rate-limit
+detector — pass ``retry_429=False``.
+"""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import requests
+
+_BACKOFF = (0.5, 1.5, 3.0)      # per-attempt sleeps
+_MAX_WAIT = 6.0                 # cap any single Retry-After honoured
 
 
 class HttpClient:
@@ -25,6 +35,7 @@ class HttpClient:
         *,
         token: str | None = None,
         raw_authorization: str | None = None,
+        retry_429: bool = True,
         **kw: Any,
     ) -> requests.Response:
         headers = dict(kw.pop("headers", {}) or {})
@@ -34,7 +45,20 @@ class HttpClient:
             headers["Authorization"] = f"{self.scheme} {token}"
         kw.setdefault("timeout", self.timeout)
         kw.setdefault("allow_redirects", False)
-        return self.s.request(method, self.url(path), headers=headers, **kw)
+        url = self.url(path)
+        resp = self.s.request(method, url, headers=headers, **kw)
+        if not retry_429:
+            return resp
+        for sleep in _BACKOFF:
+            if resp.status_code != 429:
+                return resp
+            wait = sleep
+            ra = resp.headers.get("Retry-After")
+            if ra and ra.isdigit():
+                wait = min(float(ra), _MAX_WAIT)
+            time.sleep(wait)
+            resp = self.s.request(method, url, headers=headers, **kw)
+        return resp
 
     def get(self, path, **kw):
         return self.req("GET", path, **kw)

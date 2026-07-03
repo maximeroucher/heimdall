@@ -79,6 +79,13 @@ def _bfla_admin(ctx: Context) -> None:
     if not attacker or not attacker.authed:
         ctx.note("no low-privilege principal available; BFLA check skipped")
         return
+    # A trustworthy negative needs a genuinely low-priv actor: the self-registered
+    # attacker (role 'attacker', not supplied). A supplied 'user' credential may
+    # secretly be over-privileged, which would turn a real BFLA into a false SAFE.
+    trustworthy = attacker.role == "attacker" and not attacker.supplied
+    if not trustworthy:
+        ctx.note(f"BFLA using supplied principal '{attacker.label}' of unverified "
+                 "privilege (no self-registered attacker available) — negatives are low-confidence")
     admin_routes = [
         r for r in ctx.routes
         if r.method == "GET" and not r.has_path_param
@@ -107,11 +114,16 @@ def _bfla_admin(ctx: Context) -> None:
             tools=["Burp Suite (Authorize/AuthMatrix)", "curl"],
         )
     elif admin_routes:
+        caveat = "" if trustworthy else (
+            f" NOTE: tested with the supplied principal '{attacker.label}', whose "
+            "privilege level is unverified — re-run with a known low-privilege account "
+            "to make this negative authoritative."
+        )
         ctx.finding(
             id="a01-bfla-admin-routes",
             owasp="A01", severity="SAFE",
-            title="Admin-scoped routes reject a low-privilege token",
-            summary=f"All {len(admin_routes)} admin-looking GET routes denied the attacker token.",
+            title="Admin-scoped routes reject the tested low-privilege token",
+            summary=f"All {len(admin_routes)} admin-looking GET routes denied the token." + caveat,
         )
 
 

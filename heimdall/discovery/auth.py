@@ -99,20 +99,43 @@ def detect_auth(rm: RouteMap) -> AuthProfile:
             ap.password_field = _pick_field(fields, _PASS_FIELDS, "password")
 
     # -- register endpoint -----------------------------------------------------
+    # Score candidates so a nested feature route like
+    # /competition/volunteers/shifts/{id}/register never beats real account
+    # signup: reward register/signup hints + an email/password body, and a
+    # no-path-param account-ish path; penalize deep module paths.
+    def _score_register(r: Route) -> int:
+        p, oid = r.path.lower(), (r.operation_id or "").lower()
+        blob = f"{p} {oid}"
+        if not any(h in blob for h in _REGISTER_HINTS):
+            return -1
+        score = 0
+        fields = [f.lower() for f in body_field_names(r)]
+        if any(u in fields for u in _USER_FIELDS):
+            score += 2
+        if any(pw in fields for pw in _PASS_FIELDS):
+            score += 2
+        if not r.path_params:
+            score += 2                      # account signup takes no object id
+        if "/users" in p or "account" in p:
+            score += 2
+        score -= p.count("/")               # prefer shallow (top-level) routes
+        return score
+    reg_best, reg_score = None, 0
     for r in rm.by_method("POST"):
-        p = r.path.lower()
-        oid = (r.operation_id or "").lower()
-        if any(h in p or h in oid for h in _REGISTER_HINTS):
-            ap.register_path = r.path
-            ap.register_fields = body_field_names(r)
-            break
+        sc = _score_register(r)
+        if sc > reg_score:
+            reg_best, reg_score = r, sc
+    if reg_best is not None:
+        ap.register_path = reg_best.path
+        ap.register_fields = body_field_names(reg_best)
 
     # -- "me" endpoint ---------------------------------------------------------
-    for r in rm.by_method("GET"):
-        p = r.path.lower()
-        if any(h in p for h in _ME_HINTS):
-            ap.me_path = r.path
-            break
+    # Prefer the least-nested current-user route (core /users/me over a
+    # module-scoped /loans/users/me, which needs extra scope and misleads probes).
+    me_hits = [r.path for r in rm.by_method("GET")
+               if any(h in r.path.lower() for h in _ME_HINTS)]
+    if me_hits:
+        ap.me_path = min(me_hits, key=lambda p: (p.count("/"), len(p)))
 
     # -- logout ----------------------------------------------------------------
     for r in rm.by_method("POST", "GET", "DELETE"):
