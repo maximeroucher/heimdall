@@ -97,10 +97,28 @@ Each module also emits **TESTED-SAFE** findings so the report distinguishes
 
 ## Output
 
-Writes `heimdall-report/REPORT.md` (executive summary + per-finding OWASP
-mapping, severity, evidence/PoC, reproduction, references, tools) and
-`findings.json` (machine-readable). The CLI exits non-zero when any
-HIGH/CRITICAL is found — drop it into CI as a gate.
+Each run writes to `heimdall-report/`:
+- `REPORT.md` — executive summary, **attack chains**, per-finding OWASP mapping,
+  indicative CVSS, evidence/PoC, reproduction, references, tools.
+- `REPORT.html` — the same, standalone + styled (shareable).
+- `findings.json` — machine-readable.
+- `findings.sarif` — SARIF 2.1.0 for GitHub/GitLab/Azure code-scanning
+  (real findings as `kind:fail`, TESTED-SAFE as `kind:pass`).
+
+## CI integration
+
+```bash
+# fail the build on any finding at/above a threshold (default: high)
+heimdall --url http://127.0.0.1:8000 --source . --fail-on high
+
+# regression gate: only fail on findings NOT already in a baseline report
+heimdall --url http://127.0.0.1:8000 --baseline known-findings.json --fail-on medium
+```
+
+`--fail-on {none,info,low,medium,high,critical}` sets the exit-code gate;
+`--baseline <findings.json>` suppresses already-known/accepted findings so CI
+only breaks on *new* ones. Upload `findings.sarif` with
+`github/codeql-action/upload-sarif` to surface results in the Security tab.
 
 ## Safety & scope
 

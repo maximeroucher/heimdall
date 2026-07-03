@@ -50,7 +50,11 @@ def write_reports(findings: list[Finding], out_dir: str, meta: dict) -> tuple[st
     html_path = os.path.join(out_dir, "REPORT.html")
     with open(html_path, "w") as fh:
         fh.write(_render_html(findings, meta))
-    return json_path, md_path, html_path
+    from .sarif import to_sarif
+    sarif_path = os.path.join(out_dir, "findings.sarif")
+    with open(sarif_path, "w") as fh:
+        json.dump(to_sarif(findings, meta), fh, indent=2)
+    return json_path, md_path, html_path, sarif_path
 
 
 def _render_md(findings: list[Finding], meta: dict) -> str:

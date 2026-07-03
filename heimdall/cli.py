@@ -51,6 +51,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--only", default="", help="comma list of module keys to run")
     ap.add_argument("--skip", default="", help="comma list of module keys to skip")
     ap.add_argument("--safe", action="store_true", help="non-destructive: skip mutating tests")
+    ap.add_argument("--fail-on", default="high",
+                    choices=["none", "info", "low", "medium", "high", "critical"],
+                    help="CI gate: exit non-zero if a finding is at/above this severity "
+                         "(default high; 'none' never fails)")
+    ap.add_argument("--baseline", metavar="findings.json",
+                    help="suppress findings whose id is in this prior report; gate only on NEW ones")
     ap.add_argument("--no-attacker", action="store_true",
                     help="do not self-register a low-priv attacker account")
     ap.add_argument("--discover-only", action="store_true",
@@ -119,18 +125,46 @@ def main(argv: list[str] | None = None) -> int:
     result = run(cfg, out_dir=args.out, only=only or None, skip=skip or None, safe=args.safe)
 
     counts = result.counts()
+    # Baseline diff: suppress findings already known/accepted in a prior run.
+    known = _load_baseline(args.baseline) if args.baseline else set()
+    gate = [f for f in result.issues if not known or f.id not in known]
+
     print("\n" + "=" * 60)
     print(f"[=] {len(result.findings)} findings — "
           + ", ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
-    for f in sorted(result.issues, key=lambda x: x.severity):
-        print(f"    {f.severity:9} {f.owasp}  {f.title}")
+    if known:
+        print(f"[=] baseline: {len(result.issues) - len(gate)} known, {len(gate)} new")
+    for f in sorted(gate, key=lambda x: x.severity):
+        tag = "" if not known else " (NEW)"
+        print(f"    {f.severity:9} {f.owasp}  {f.title}{tag}")
     print(f"\n[=] Report:  {result.report_paths[1]}")
     if len(result.report_paths) > 2:
         print(f"[=] HTML:    {result.report_paths[2]}")
+    if len(result.report_paths) > 3:
+        print(f"[=] SARIF:   {result.report_paths[3]}")
     print(f"[=] JSON:    {result.report_paths[0]}")
-    # exit non-zero if anything HIGH/CRITICAL, handy for CI gating
-    bad = [f for f in result.issues if f.severity in ("HIGH", "CRITICAL")]
+
+    # CI gate: exit non-zero if any (new, if baseline) finding is at/above --fail-on.
+    order = ["info", "low", "medium", "high", "critical"]
+    if args.fail_on == "none":
+        return 0
+    threshold = order.index(args.fail_on)
+    bad = [f for f in gate if f.severity.lower() in order
+           and order.index(f.severity.lower()) >= threshold]
+    if bad:
+        print(f"\n[!] {len(bad)} finding(s) at/above '{args.fail_on}' — failing (exit 1)")
     return 1 if bad else 0
+
+
+def _load_baseline(path: str) -> set:
+    import json as _json
+    try:
+        data = _json.load(open(path))
+    except (OSError, ValueError) as exc:
+        print(f"[!] could not read baseline {path}: {exc}")
+        return set()
+    items = data.get("findings", data) if isinstance(data, dict) else data
+    return {f.get("id") for f in items if isinstance(f, dict) and f.get("id")}
 
 
 if __name__ == "__main__":
