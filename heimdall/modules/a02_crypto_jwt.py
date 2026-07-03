@@ -318,17 +318,29 @@ def _leaked_private_key(ctx: Context, header: dict, claims: dict, token: str) ->
             tools=["jwt_tool", "pyjwt", "git log -p"],
         )
     else:
+        from ..discovery.source import dev_config_signal
         srcs = ", ".join(s.source for s in keys)
+        # A committed key in a DEV/example config is bad hygiene, but not proof of
+        # a production compromise (prod likely injects its own key). Don't rate it
+        # as if prod inherits it — downgrade and caveat.
+        dev = dev_config_signal(ctx.profile.source_path) if ctx.profile.source_path else None
+        sev = "MEDIUM" if dev else "HIGH"
+        dev_note = (f" NOTE: this looks like a dev/example config ({dev}), so the "
+                    "committed key is probably a development key — rotate it and purge "
+                    "it from history regardless, but it is CRITICAL only if the SAME "
+                    "key signs production tokens (verify the prod config).") if dev else ""
         ctx.finding(
-            id="a02-leaked-signing-key", owasp="A02", severity="HIGH",
-            title="Asymmetric private key committed in source",
+            id="a02-leaked-signing-key", owasp="A02", severity=sev,
+            title=("Asymmetric private key committed in source"
+                   + (" (dev/example config)" if dev else "")),
             summary=(
                 f"An RSA/EC private key is committed in the repository ({srcs}). Even though "
                 "the current access token is symmetric (couldn't prove live forgery here), a "
                 "committed private key typically signs id_tokens/other artifacts and is a "
-                "serious secret exposure — rotate it and purge it from git history."
+                "secret exposure — rotate it and purge it from git history." + dev_note
             ),
-            evidence=f"private key material found at: {srcs}",
+            evidence=f"private key material found at: {srcs}"
+                     + (f"  [{dev}]" if dev else ""),
             references=[REFS["A02"]],
             tools=["gitleaks", "trufflehog", "git filter-repo"],
         )

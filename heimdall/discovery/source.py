@@ -137,6 +137,46 @@ def looks_like_placeholder(value: str) -> bool:
     return bool(_PLACEHOLDER.search(value))
 
 
+_DEV_MARKERS = re.compile(
+    r"(?i)(debug\s*[:=]\s*true|\blocalhost\b|127\.0\.0\.1|host\.docker\.internal"
+    r"|for (?:local )?development|for testing|example\.com|changeme|dummy)")
+
+
+def dev_config_signal(source_path: str) -> str | None:
+    """Heuristic: does the committed config look like a DEV / example config
+    rather than production? If so, secrets/policies scanned from it (a committed
+    key, a loose CORS setting) are dev artifacts — bad hygiene, but not proof of a
+    production compromise — so config-derived findings should be caveated and not
+    rated as if prod inherits them. Returns a short reason, or None.
+
+    Signals: a ``*.template`` / ``*.example`` / ``*.sample`` sibling (implies the
+    real config file is a local fill-in), and dev markers (debug=true, localhost,
+    'for development', example.com) inside the config files."""
+    root = Path(source_path)
+    if not root.exists():
+        return None
+    reasons: list[str] = []
+    tmpl = (list(root.glob("*.template.*")) + list(root.glob("*.template"))
+            + list(root.glob("*.example*")) + list(root.glob("*.sample*"))
+            + list(root.glob(".env.example")))
+    if tmpl:
+        reasons.append(f"a config template exists ({tmpl[0].name}) — the committed "
+                       "config is a local/dev fill-in")
+    hits = 0
+    for i, fp in enumerate(_iter_files(root, _SECRET_FILES)):
+        if i > 60:
+            break
+        try:
+            text = fp.read_text(errors="ignore")
+        except OSError:
+            continue
+        if _DEV_MARKERS.search(text):
+            hits += 1
+    if hits:
+        reasons.append(f"dev markers (debug/localhost/example) in {hits} config file(s)")
+    return "; ".join(reasons) if reasons else None
+
+
 # ── App-object / launch discovery ────────────────────────────────────────────
 
 _APP_ASSIGN = re.compile(r"^\s*(\w+)\s*(?::\s*[\w\[\], .]+)?=\s*(?:FastAPI\(|get_application\(|create_app\()", re.M)

@@ -141,14 +141,17 @@ def _cors(ctx: Context) -> None:
             if creds:
                 ctx.finding(
                     id="a05-cors-wildcard-credentialed",
-                    owasp="A05", severity="HIGH",
+                    owasp="A05", severity="MEDIUM",
                     title="CORS wildcard origin combined with credentials",
                     summary=(
                         "`Access-Control-Allow-Origin: *` is sent alongside "
-                        "`Access-Control-Allow-Credentials: true`. Browsers reject this "
-                        "invalid combination, but the intent is clearly broken and some "
-                        "middleware/proxies rewrite `*` to the caller's origin — treat as "
-                        "a credentialed-CORS exposure and fix the policy."
+                        "`Access-Control-Allow-Credentials: true`. This is a broken policy, "
+                        "but NOT directly exploitable: browsers reject the literal `*` + "
+                        "credentials combination and won't expose the response to JS. The "
+                        "genuinely exploitable variant is a REFLECTED origin + credentials "
+                        "(reported separately as HIGH). Fix the policy — pin explicit "
+                        "origins — and verify this reflects your production CORS config, "
+                        "not just a permissive dev setting."
                     ),
                     evidence=evidence,
                     reproduction=repro,
