@@ -34,11 +34,13 @@ _XSS_ROUTE_CAP = 25
 _OPINJ_HINT = ("login", "token", "auth", "signin", "search", "filter", "query", "find")
 
 
-@module("a03", "Injection (SQLi / XSS)")
+@module("a03", "Injection (SQLi / XSS / SSTI / traversal)")
 def run(ctx: Context) -> None:
     _sqli_sweep(ctx)
     _xss_probe(ctx)
     _operator_injection(ctx)
+    _ssti_probe(ctx)
+    _path_traversal_probe(ctx)
 
 
 def _actor_token(ctx: Context) -> str | None:
@@ -291,4 +293,184 @@ def _operator_injection(ctx: Context) -> None:
                 f"Sent a {{\"$ne\": null}} operator object to {len(targets)} auth/filter "
                 "route(s); none errored or bypassed validation."
             ),
+        )
+
+
+# ── Server-side template injection (SSTI) ─────────────────────────────────────
+
+# Marker-wrapped so the evaluated product (191*7=1337) can't be a coincidence:
+# a hit means the engine computed our expression between the markers.
+_SSTI_MARK = "hh"
+_SSTI_EXPECT = f"{_SSTI_MARK}1337{_SSTI_MARK}"
+_SSTI_PAYLOADS = [
+    f"{_SSTI_MARK}{{{{191*7}}}}{_SSTI_MARK}",   # Jinja2/Twig  {{191*7}}
+    f"{_SSTI_MARK}${{191*7}}{_SSTI_MARK}",       # Freemarker/JSP EL  ${191*7}
+    f"{_SSTI_MARK}#{{191*7}}{_SSTI_MARK}",       # Ruby/Thymeleaf  #{191*7}
+    f"{_SSTI_MARK}<%= 191*7 %>{_SSTI_MARK}",     # ERB
+    f"{_SSTI_MARK}*{{191*7}}{_SSTI_MARK}",       # Thymeleaf  *{...}
+]
+_SSTI_ROUTE_CAP = 30
+
+
+def _ssti_probe(ctx: Context) -> None:
+    """Inject template expressions into string inputs; a marker-wrapped evaluated
+    product in the response confirms server-side template injection (→ RCE)."""
+    token = _actor_token(ctx)
+    hits = []
+    tested = 0
+    # query params on GETs
+    for r in ctx.routes.by_method("GET"):
+        if not r.query_params:
+            continue
+        for param in r.query_params[:3]:
+            pname = param.get("name")
+            if not pname:
+                continue
+            tested += 1
+            if _ssti_hit_query(ctx, r, pname, token):
+                hits.append(f"GET {r.path}?{pname}")
+                break
+        if len(hits) >= 15 or tested > 60:
+            break
+    # string body fields on writes
+    if not ctx.safe:
+        for r in ctx.routes.by_method("POST", "PUT", "PATCH")[:_SSTI_ROUTE_CAP]:
+            fields = body_field_names(r)
+            if not fields:
+                continue
+            tested += 1
+            if _ssti_hit_body(ctx, r, fields, token):
+                hits.append(f"{r.method} {r.path}")
+    else:
+        ctx.note("safe mode: SSTI body-injection skipped (query params still tested)")
+
+    if hits:
+        ctx.finding(
+            id="a03-ssti", owasp="A03", severity="CRITICAL",
+            title=f"Server-side template injection on {len(hits)} input(s)",
+            summary=(
+                "A template expression injected into user input was EVALUATED by the server "
+                f"(our marker-wrapped `191*7` came back as `{_SSTI_EXPECT}`). SSTI typically "
+                "escalates to remote code execution. Never render user input as a template; "
+                "use logic-less templates / sandboxing and pass data as context variables."
+            ),
+            evidence="evaluated at:\n  " + "\n  ".join(hits[:15]),
+            reproduction="Inject {{191*7}} / ${191*7} into the field and look for 1337.",
+            references=[REFS["A03"], "https://portswigger.net/web-security/server-side-template-injection"],
+            tools=["tplmap", "Burp", "SSTImap"],
+        )
+    elif tested:
+        ctx.finding(
+            id="a03-ssti", owasp="A03", severity="SAFE",
+            title="No server-side template injection signal",
+            summary=f"Template-expression payloads across {tested} input(s) were not evaluated.",
+        )
+
+
+def _ssti_hit_query(ctx, r, pname, token) -> bool:
+    for payload in _SSTI_PAYLOADS:
+        try:
+            resp = ctx.get(r.fill_path({}), token=token, params={pname: payload})
+        except Exception as exc:  # noqa: BLE001
+            ctx.note(f"SSTI probe {r.path}?{pname} failed: {exc}")
+            return False
+        if _SSTI_EXPECT in (resp.text or ""):
+            return True
+    return False
+
+
+def _ssti_hit_body(ctx, r, fields, token) -> bool:
+    for payload in _SSTI_PAYLOADS:
+        body = {f: payload for f in fields[:8]}
+        try:
+            resp = ctx.request(r.method, r.fill_path({}), token=token, json=body)
+        except Exception as exc:  # noqa: BLE001
+            ctx.note(f"SSTI body probe {r.method} {r.path} failed: {exc}")
+            return False
+        if _SSTI_EXPECT in (resp.text or ""):
+            return True
+    return False
+
+
+# ── Path traversal ────────────────────────────────────────────────────────────
+
+_TRAVERSAL_NAMES = (
+    "file", "filename", "filepath", "path", "name", "template", "download",
+    "doc", "document", "page", "include", "view", "dir", "folder", "attachment",
+    "log", "read", "resource", "asset", "img_path", "load",
+)
+_TRAVERSAL_PAYLOADS = [
+    "../../../../../../../../etc/passwd",
+    "....//....//....//....//....//etc/passwd",
+    "..%2f..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
+    "/etc/passwd",
+    "../../../../../../../../etc/hostname",
+]
+import re as _re  # noqa: E402
+_PASSWD_RE = _re.compile(r"root:.*?:0:0:")
+
+
+def _traversal_name(n: str) -> bool:
+    n = (n or "").lower()
+    return any(h == n or h in n for h in _TRAVERSAL_NAMES)
+
+
+def _path_traversal_probe(ctx: Context) -> None:
+    """Inject path-traversal sequences into file/path-ish inputs; the contents of
+    /etc/passwd (root:...:0:0:) in the response confirms arbitrary file read."""
+    token = _actor_token(ctx)
+    hits = []
+    tested = 0
+    for r in ctx.routes.by_method("GET"):
+        for param in r.query_params:
+            pname = param.get("name")
+            if not _traversal_name(pname):
+                continue
+            tested += 1
+            for payload in _TRAVERSAL_PAYLOADS:
+                try:
+                    resp = ctx.get(r.fill_path({}), token=token, params={pname: payload})
+                except Exception as exc:  # noqa: BLE001
+                    ctx.note(f"traversal probe {r.path}?{pname} failed: {exc}")
+                    break
+                if _PASSWD_RE.search(resp.text or ""):
+                    hits.append(f"GET {r.path}?{pname}")
+                    break
+    # path params that look like a filename/path
+    for r in ctx.routes.by_method("GET"):
+        for pp in r.path_params:
+            if not _traversal_name(pp):
+                continue
+            tested += 1
+            for payload in _TRAVERSAL_PAYLOADS:
+                enc = payload.replace("/", "%2f")
+                try:
+                    resp = ctx.get(r.fill_path({pp: enc}), token=token)
+                except Exception:  # noqa: BLE001
+                    break
+                if _PASSWD_RE.search(resp.text or ""):
+                    hits.append(f"GET {r.path} [{pp}]")
+                    break
+
+    if hits:
+        ctx.finding(
+            id="a03-path-traversal", owasp="A03", severity="HIGH",
+            title=f"Path traversal / arbitrary file read on {len(hits)} input(s)",
+            summary=(
+                "A `../`-style payload made the server return the contents of /etc/passwd "
+                "(matched `root:…:0:0:`). An attacker can read arbitrary files (configs, keys, "
+                "source). Resolve user paths against a fixed base and reject `..` / absolute "
+                "paths; prefer opaque ids over filenames."
+            ),
+            evidence="file read at:\n  " + "\n  ".join(hits[:15]),
+            reproduction="Set the file/path parameter to ../../../../etc/passwd (and URL-encoded).",
+            references=[REFS["A03"], "https://portswigger.net/web-security/file-path-traversal"],
+            tools=["Burp", "ffuf", "dotdotpwn"],
+        )
+    elif tested:
+        ctx.finding(
+            id="a03-path-traversal", owasp="A03", severity="SAFE",
+            title="No path-traversal file read",
+            summary=f"Traversal payloads across {tested} file/path input(s) did not return "
+                    "system file contents.",
         )
