@@ -73,6 +73,29 @@ _AUTH_HINTS = ("auth", "login", "token", "oauth", "session", "sso", "connect")
 _MAX_ROUTES = 40
 _MAX_DEPTH = 6
 
+# Plaintext-password detection by VALUE (not field name): if a response echoes a
+# value we KNOW is a password — a credential the scan authenticated with, or a
+# provisioned user's password — it's a definitive plaintext leak. Backed up by a
+# short list of *complex* common passwords (kept complex so they can't collide
+# with a legitimate role/status/username value like "admin" or "test").
+_COMMON_PASSWORDS = {
+    "password123", "Password1!", "P@ssw0rd", "Passw0rd!", "changeme123",
+    "letmein123", "qwerty123", "welcome123", "iloveyou1", "admin@123",
+    "Summer2024!", "Winter2024!",
+}
+
+
+def _known_passwords(ctx: Context) -> set[str]:
+    """Real password values the scan holds — every authenticated/provisioned
+    principal's password — plus complex common ones. A response containing any of
+    these is leaking a plaintext password, confirmed by value with no field-name
+    guessing and no false positives."""
+    pws = set(_COMMON_PASSWORDS)
+    for p in ctx.profile.principals.values():
+        if getattr(p, "password", None) and len(p.password) >= 4:
+            pws.add(p.password)
+    return pws
+
 
 @module("data-exposure", "Excessive Data Exposure")
 def run(ctx: Context) -> None:
@@ -82,11 +105,12 @@ def run(ctx: Context) -> None:
         ctx.note("data-exposure: no GET endpoints to inspect")
         return
 
+    known_pw = _known_passwords(ctx)
     hits: list[dict] = []
     probed = 0
     for r in routes:
         probed += 1
-        _inspect(ctx, r, token, hits)
+        _inspect(ctx, r, token, hits, known_pw)
 
     ctx.note(f"data-exposure: inspected {probed} GET response(s); "
              f"{len(hits)} exposed a sensitive field")
@@ -106,7 +130,7 @@ def _is_auth_route(route) -> bool:
     return any(h in hay for h in _AUTH_HINTS)
 
 
-def _inspect(ctx: Context, route, token, hits: list[dict]) -> None:
+def _inspect(ctx: Context, route, token, hits: list[dict], known_pw: set) -> None:
     path = route.fill_path({p: "1" for p in route.path_params})
     try:
         resp = ctx.get(path, token=token, timeout=10, retry_429=False)
@@ -121,7 +145,7 @@ def _inspect(ctx: Context, route, token, hits: list[dict]) -> None:
         return
     auth_route = _is_auth_route(route)
     for keypath, key, value in _walk(data):
-        res = _sensitive(key, value, auth_route)
+        res = _sensitive(key, value, auth_route, known_pw)
         if res:
             reason, severity = res
             hits.append({"route": route, "keypath": keypath, "key": key,
@@ -210,7 +234,7 @@ def _entropy_secret(sval: str) -> bool:
     return _shannon(sval) >= 3.5
 
 
-def _sensitive(key: str, value, auth_route: bool):
+def _sensitive(key: str, value, auth_route: bool, known_pw: set):
     """Return (reason, severity) or None. Value format/checksum matches are
     HIGH-confidence; entropy and name-based matches are MEDIUM."""
     if value is None or value == "" or value is True or value is False:
@@ -222,12 +246,16 @@ def _sensitive(key: str, value, auth_route: bool):
     vleak = _value_leak(sval)
     if vleak:
         return f"value is a {vleak}", "HIGH"
-    # 2) a high-entropy token/key with no known format — behavioural, name-blind.
+    # 2) the VALUE equals a password we know is a password — a credential the scan
+    #    authenticated with, or a complex common one. Definitive plaintext leak,
+    #    matched by value (no field name), so it fires even under an odd key.
+    if sval in known_pw:
+        return "value is a plaintext password (matches a known/used credential)", "HIGH"
+    # 3) a high-entropy token/key with no known format — behavioural, name-blind.
     if _entropy_secret(sval):
         return "value is a high-entropy secret-like string (probable token/key)", "MEDIUM"
-    # 3) field NAME denotes a secret — the fallback for values that have no
-    #    detectable format (a plaintext password looks like any string, so only
-    #    the name can flag it). Lower-confidence than a value match.
+    # 4) field NAME denotes a secret — last-resort fallback for a plaintext value
+    #    we neither recognise as a format nor know as a credential.
     if kl in _SECRET_KEYS:
         return f"field '{key}' (secret-bearing) is present in the response", "MEDIUM"
     # 4) a bare 'token'/'jwt' key — sensitive unless this is a token-issuing route
