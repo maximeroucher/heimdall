@@ -101,6 +101,15 @@ def _find_private_keys(text: str) -> list[str]:
     return [m.group(0) for m in _PRIVKEY_RE.finditer(normalised)]
 
 
+def detect_db_url(source_path: str, secrets: list[Secret] | None = None) -> str | None:
+    """The app's database connection string, from a source scan — so Heimdall can
+    spawn a throwaway DB of the right kind (Postgres/MySQL/SQLite) automatically."""
+    for s in (secrets if secrets is not None else scan_secrets(source_path)):
+        if s.kind == "db_url" and "://" in s.value:
+            return s.value.strip()
+    return None
+
+
 def jwt_secret_candidates(secrets: list[Secret]) -> list[str]:
     """Ordered, de-duped list of plausible HS256 signing keys to try.
 

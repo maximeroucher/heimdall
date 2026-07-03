@@ -99,10 +99,14 @@ def _find_user_table(insp, override: str | None) -> tuple[str, dict]:
             continue
         if not override and any(s in low for s in _SKIP_TABLE):
             continue
-        cols = {c["name"].lower(): c["name"] for c in insp.get_columns(table)}
+        columns = insp.get_columns(table)
+        cols = {c["name"].lower(): c["name"] for c in columns}
         email = next((cols[h] for h in _EMAIL_HINTS if h in cols), None)
         pw = next((cols[h] for h in _PWHASH_HINTS if h in cols), None)
-        pk = next((c["name"] for c in insp.get_columns(table) if c.get("primary_key")), None)
+        # PK cross-dialect: get_columns()['primary_key'] is SQLite-only; Postgres
+        # exposes it via get_pk_constraint. Fall back to an 'id' column.
+        pk_cols = (insp.get_pk_constraint(table) or {}).get("constrained_columns") or []
+        pk = pk_cols[0] if pk_cols else (cols.get("id"))
         if not (email and pw and pk):
             continue
         # score: exact user-ish name + presence of an admin flag
@@ -113,8 +117,20 @@ def _find_user_table(insp, override: str | None) -> tuple[str, dict]:
             score += 3
         admin = next((cols[f] for f in _ADMIN_FLAGS if f in cols), None)
         active = next((cols[f] for f in _ACTIVE_FLAGS if f in cols), None)
+        # UNIQUE string columns (username/login/...) must get a distinct value per
+        # clone or the insert collides — collect them so the inserter can vary them.
+        coltype = {c["name"]: str(c["type"]).upper() for c in columns}
+        uniq: set = set()
+        for u in insp.get_unique_constraints(table):
+            uniq |= set(u.get("column_names") or [])
+        for ix in insp.get_indexes(table):
+            if ix.get("unique"):
+                uniq |= {c for c in (ix.get("column_names") or []) if c}
+        unique_str = [c for c in uniq if c and c not in (pk, email, pw)
+                      and any(t in coltype.get(c, "") for t in ("CHAR", "TEXT", "STRING"))]
         candidates.append((score, table, {"email": email, "pw": pw, "pk": pk,
-                                          "admin": admin, "active": active}))
+                                          "admin": admin, "active": active,
+                                          "unique": unique_str}))
     if not candidates:
         raise _ProvisionError("could not locate an authenticatable user table")
     candidates.sort(key=lambda c: c[0], reverse=True)
@@ -190,10 +206,16 @@ def _provision_via_db(profile: AppProfile, req: ProvisionRequest,
             new[roles["pk"]] = str(uuid.uuid4())
             new[roles["email"]] = ident
             new[roles["pw"]] = _bcrypt_hash(req.password)
+            # Give every UNIQUE string column (username/login/…) a distinct value.
+            for uc in roles.get("unique", []):
+                if uc in new:
+                    new[uc] = f"heimdall_{base_label}{idx}"[:60]
+            # Python bools work for both Postgres BOOLEAN and SQLite; ints don't
+            # (Postgres rejects integer-for-boolean).
             if roles["admin"]:
-                new[roles["admin"]] = 1 if want_admin else 0
+                new[roles["admin"]] = bool(want_admin)
             if roles["active"]:
-                new[roles["active"]] = 1
+                new[roles["active"]] = True
             cols = [c for c in all_cols if c in new]
             conn.execute(
                 text(f'INSERT INTO "{table}" ({",".join(chr(34)+c+chr(34) for c in cols)}) '

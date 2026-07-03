@@ -25,6 +25,7 @@ full = [
     "pip-audit>=2.7",
     "SQLAlchemy>=2.0",
     "bcrypt>=4.0",
+    "psycopg2-binary>=2.9",
     "tomli>=2.0; python_version < '3.11'",
 ]
 dev = [

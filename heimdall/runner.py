@@ -63,13 +63,21 @@ def run(
     if config.spawn_db:
         from .bootstrap import testdb as testdb_mod
         if not config.launch_cwd:
-            raise SystemExit("[!] spawn_db requires launch_cwd (where the sqlite file lives)")
-        testdb = testdb_mod.spawn_sqlite(
-            config.launch_cwd, name=config.spawn_db_name,
-            env_var=config.spawn_db_env_var, relative_filename=config.spawn_db_relative)
+            raise SystemExit("[!] spawn_db requires launch_cwd")
+        # Auto-detect the app's DB kind from its config so we spawn the right
+        # throwaway (a Postgres/MySQL database, or a SQLite file).
+        source_db = config.db_url
+        if not source_db and config.source_path:
+            from .discovery.source import detect_db_url
+            source_db = detect_db_url(config.source_path)
+        testdb = testdb_mod.spawn(
+            config.launch_cwd, source_db_url=source_db,
+            sqlite_name=config.spawn_db_name, sqlite_env_var=config.spawn_db_env_var)
         launch_env.update(testdb.launch_env)
         db_url = testdb.connect_url
-        print(f"[*] spawned throwaway DB: {testdb.path}")
+        print(f"[*] spawned throwaway {testdb.kind} DB: {testdb.path}")
+        if testdb.kind != "sqlite":
+            print(f"[*] target will launch with DATABASE_URL -> …/{testdb.path}")
 
     proc = None
     if config.launch:
