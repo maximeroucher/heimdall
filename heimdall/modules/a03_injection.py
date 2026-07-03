@@ -16,6 +16,7 @@ Fully route-map driven, so it works on any FastAPI target:
 from __future__ import annotations
 
 from ..core.context import Context
+from ..core.reqbuild import build_request, string_body_fields
 from ..core.taxonomy import REFS
 from ..discovery.openapi import body_field_names
 from .base import body_says_error, module
@@ -165,17 +166,18 @@ def _xss_probe(ctx: Context) -> None:
         ctx.note("no JSON-body write routes; XSS probe skipped")
         return
 
+    princ = ctx.principal("attacker", "user")
     reflected = []
     for n, r in enumerate(targets):
-        fields = body_field_names(r)
-        marker = f"heimallmarker{n}"
         payload = f"<script>heimdall{n}</script>"
-        # Fill every field with the payload; string typing is best-effort here,
-        # non-string fields simply get rejected by validation (harmless).
-        body = {f: payload for f in fields}
-        body["_heimdall_marker"] = marker  # extra field, ignored by most schemas
+        # Build a VALID request (typed fields synthesised, FK ids + path resolved)
+        # and drop the payload only into string fields, so the request passes
+        # validation and the payload actually lands where it may be rendered.
+        sfields = string_body_fields(r) or body_field_names(r)
+        overrides = {f: payload for f in sfields}
+        path, body = build_request(ctx, r, token, principal=princ, overrides=overrides)
         try:
-            resp = ctx.request(r.method, r.fill_path({}), token=token, json=body)
+            resp = ctx.request(r.method, path, token=token, json=body)
         except Exception as exc:
             ctx.note(f"XSS probe failed for {r.method} {r.path}: {exc}")
             continue
@@ -380,10 +382,14 @@ def _ssti_hit_query(ctx, r, pname, token) -> bool:
 
 
 def _ssti_hit_body(ctx, r, fields, token) -> bool:
+    princ = ctx.principal("attacker", "user")
+    sfields = string_body_fields(r) or fields
     for payload in _SSTI_PAYLOADS:
-        body = {f: payload for f in fields[:8]}
+        # valid request with the SSTI payload in string fields (path/FK resolved)
+        overrides = {f: payload for f in sfields[:8]}
+        path, body = build_request(ctx, r, token, principal=princ, overrides=overrides)
         try:
-            resp = ctx.request(r.method, r.fill_path({}), token=token, json=body)
+            resp = ctx.request(r.method, path, token=token, json=body)
         except Exception as exc:  # noqa: BLE001
             ctx.note(f"SSTI body probe {r.method} {r.path} failed: {exc}")
             return False

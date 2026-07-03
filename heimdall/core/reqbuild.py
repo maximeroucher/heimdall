@@ -31,8 +31,13 @@ def _synth_scalar(name: str) -> str:
     return "1" if _looks_fk(name) else "heimdall"
 
 
-def build_request(ctx: Context, route, token: str | None, principal=None):
-    """Return (filled_path, body) — a best-effort valid request for ``route``."""
+def build_request(ctx: Context, route, token: str | None, principal=None, overrides=None):
+    """Return (filled_path, body) — a best-effort valid request for ``route``.
+
+    ``overrides`` (a dict) replaces specific body fields after synthesis — used
+    by the injection modules to drop a payload into one field while the rest of
+    the body stays valid, so the request passes validation and reaches the sink.
+    """
     vals = {}
     for p in route.path_params:
         if principal and principal.user_id and "user" in p.lower():
@@ -41,7 +46,25 @@ def build_request(ctx: Context, route, token: str | None, principal=None):
             vals[p] = harvest_id(ctx, p, token, route.path) or _synth_scalar(p)
     path = route.fill_path(vals)
     body = _build_body(ctx, route, token) if route.body_schema else {}
+    if overrides:
+        body.update(overrides)
     return path, body
+
+
+def string_body_fields(route) -> list[str]:
+    """Names of string-typed body fields — the injectable ones."""
+    schema = route.body_schema or {}
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return []
+    out = []
+    for name, s in props.items():
+        if not isinstance(s, dict) or s.get("enum"):
+            continue
+        t = s.get("type")
+        if t == "string" or (t is None and "format" not in s):
+            out.append(name)
+    return out
 
 
 def _build_body(ctx: Context, route, token: str | None) -> dict:

@@ -12,6 +12,7 @@ Fully route-map driven, so it works on any FastAPI target:
 from __future__ import annotations
 
 from ..core.context import Context
+from ..core.reqbuild import build_request
 from ..core.taxonomy import REFS
 from .base import looks_like_id_param, module
 
@@ -322,7 +323,11 @@ def _write_bola(ctx: Context) -> None:
     strong, weak = [], []
     for r in routes[:60]:
         pname = r.path_params[0]
-        body = None if r.method == "DELETE" else {}
+        # A valid body (typed/FK-resolved) so PATCH/PUT reach the handler instead
+        # of 422-ing on validation before the ownership check runs.
+        body = None
+        if r.method != "DELETE":
+            _, body = build_request(ctx, r, attacker.token, principal=attacker)
         try:
             vic = ctx.request(r.method, r.fill_path({pname: victim.user_id}),
                               token=attacker.token, json=body)
