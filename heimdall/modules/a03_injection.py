@@ -529,6 +529,14 @@ def _prototype_pollution(ctx: Context) -> None:
 
     sent, crashed = [], []
     for r in write_routes:
+        # Baseline: the SAME synthesised body WITHOUT pollution keys. If it already
+        # 500s (e.g. it references objects that don't exist), a 500 on the polluted
+        # body proves nothing — only a crash the benign body did NOT cause is signal.
+        bpath, bbody = build_request(ctx, r, token, principal=princ)
+        try:
+            base_500 = ctx.request(r.method, bpath, token=token, json=bbody).status_code >= 500
+        except Exception:  # noqa: BLE001
+            base_500 = True   # can't establish a baseline -> don't attribute crashes here
         for pp in _PP_PAYLOADS:
             path, body = build_request(ctx, r, token, principal=princ)
             body.update(pp)                       # valid fields + pollution keys
@@ -538,7 +546,7 @@ def _prototype_pollution(ctx: Context) -> None:
                 ctx.note(f"object-pollution probe {r.method} {r.path} failed: {exc}")
                 continue
             sent.append((r, path, body, pp))
-            if resp.status_code >= 500:
+            if resp.status_code >= 500 and not base_500:
                 crashed.append((r, path, pp))
 
     # Two-step: did the injected canary LEAK into an unrelated response? That is
