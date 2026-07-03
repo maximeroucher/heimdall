@@ -119,6 +119,8 @@ def run(ctx: Context) -> None:
 
     _alg_none(ctx, header, claims, token)
     _weak_secret(ctx, header, claims, token)
+    _alg_confusion(ctx, header, claims, token)
+    _leaked_private_key(ctx, header, claims, token)
     _token_in_query(ctx)
 
 
@@ -212,6 +214,121 @@ def _weak_secret(ctx: Context, header: dict, claims: dict, token: str) -> None:
                 "wordlist) matched the token signature. Not a proof of strength — "
                 "run a full hashcat/jwt_tool crack against a large wordlist for assurance.",
     )
+
+
+def _is_asymmetric(alg: str) -> bool:
+    return str(alg).upper()[:2] in ("RS", "ES", "PS")
+
+
+def _pubkey_variants(pem: str) -> list[str]:
+    """The exact bytes a vulnerable verifier feeds to the HMAC differ by trivia
+    (trailing newline, CRLF). Try the common encodings of the public key PEM."""
+    p = pem.strip()
+    return list(dict.fromkeys([pem, p, p + "\n", p + "\n\n", p.replace("\n", "\r\n") + "\r\n"]))
+
+
+def _alg_confusion(ctx: Context, header: dict, claims: dict, token: str) -> None:
+    """RS256→HS256 confusion: if a verifier doesn't pin the algorithm, an
+    attacker signs an HS256 token using the app's PUBLIC RSA key as the HMAC
+    secret — and the server, holding that public key, verifies it as valid.
+    """
+    if not _is_asymmetric(header.get("alg", "")):
+        ctx.note(f"token alg {header.get('alg')} is symmetric; RS→HS confusion N/A")
+        return
+    from ..discovery import jwks
+    pems = jwks.discover_public_keys(ctx.base_url)
+    for s in ctx.profile.secrets:
+        if s.kind == "rsa_private_key":
+            pub = jwks.public_pem_from_private(s.value)
+            if pub:
+                pems.append(pub)
+    pems = list(dict.fromkeys(pems))
+    if not pems:
+        ctx.note("token is asymmetric but no public key (JWKS/OIDC/source) found; "
+                 "algorithm-confusion untested")
+        return
+    for pem in pems:
+        for variant in _pubkey_variants(pem):
+            forged = _encode({**header, "alg": "HS256"}, _escalate(claims), variant)
+            ok, code = _accepts(ctx, forged, token)
+            if ok:
+                ctx.finding(
+                    id="a02-alg-confusion", owasp="A02", severity="CRITICAL",
+                    title="JWT algorithm confusion (RS256→HS256) — public key forges tokens",
+                    summary=(
+                        "The verifier accepted an HS256 token signed with the server's own "
+                        "RSA public key as the HMAC secret. Because the public key is, by "
+                        "design, public, anyone can mint valid tokens with arbitrary claims. "
+                        "The verifier must pin the expected algorithm (asymmetric only)."
+                    ),
+                    evidence=f"forged HS256(token, <public-key-PEM>) accepted "
+                             f"(HTTP {code}) at the protected route\npublic key:\n{pem[:200]}…",
+                    reproduction="jwt_tool <token> -X k -pk public.pem   # algorithm confusion",
+                    references=[REFS["ps-jwt"], REFS["A02"]],
+                    tools=["jwt_tool -X k", "Burp (JWT Editor)"],
+                )
+                return
+    ctx.finding(
+        id="a02-alg-confusion", owasp="A02", severity="SAFE",
+        title="JWT algorithm confusion (RS→HS) rejected",
+        summary=f"Signing HS256 tokens with {len(pems)} discovered public key(s) was not "
+                "accepted — the verifier appears to pin the algorithm.",
+    )
+
+
+def _leaked_private_key(ctx: Context, header: dict, claims: dict, token: str) -> None:
+    """A committed asymmetric private key lets an attacker forge validly-signed
+    tokens directly. Report the exposure, and if the token IS asymmetric, prove
+    it by forging + replaying an escalated token signed with the leaked key."""
+    keys = [s for s in ctx.profile.secrets if s.kind == "rsa_private_key"]
+    if not keys:
+        return
+    forged_ok = None
+    if _is_asymmetric(header.get("alg", "")):
+        try:
+            import jwt as pyjwt
+            alg = header.get("alg", "RS256")
+            for s in keys:
+                signed = pyjwt.encode(_escalate(claims), s.value, algorithm=alg,
+                                      headers={k: v for k, v in header.items() if k != "alg"})
+                ok, code = _accepts(ctx, signed, token)
+                if ok:
+                    forged_ok = (s, code)
+                    break
+        except Exception as exc:  # noqa: BLE001
+            ctx.note(f"RS forge attempt errored: {exc}")
+
+    if forged_ok:
+        s, code = forged_ok
+        ctx.finding(
+            id="a02-leaked-signing-key", owasp="A02", severity="CRITICAL",
+            title="Token signing private key committed in source — full forgery",
+            summary=(
+                f"An RSA private key is committed at {s.source} and it signs the tokens: a "
+                "forged, escalated token signed with it was accepted by the server. Anyone "
+                "with repo access can mint tokens for any user/role. Rotate the key and "
+                "remove it from source + history."
+            ),
+            evidence=f"forged {header.get('alg')} token signed with {s.source} "
+                     f"accepted (HTTP {code})",
+            references=[REFS["A02"]],
+            tools=["jwt_tool", "pyjwt", "git log -p"],
+        )
+    else:
+        srcs = ", ".join(s.source for s in keys)
+        ctx.finding(
+            id="a02-leaked-signing-key", owasp="A02", severity="HIGH",
+            title="Asymmetric private key committed in source",
+            summary=(
+                f"An RSA/EC private key is committed in the repository ({srcs}). Even though "
+                "the current access token is symmetric (couldn't prove live forgery here), a "
+                "committed private key typically signs id_tokens/other artifacts and is a "
+                "serious secret exposure — rotate it and purge it from git history."
+            ),
+            evidence=f"private key material found at: {srcs}",
+            references=[REFS["A02"]],
+            tools=["gitleaks", "trufflehog", "git filter-repo"],
+        )
 
 
 def _token_in_query(ctx: Context) -> None:

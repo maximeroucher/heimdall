@@ -21,6 +21,7 @@ dependencies = [
 # White-box extras: JWT forging + dependency auditing.
 full = [
     "PyJWT>=2.8",
+    "cryptography>=42.0",
     "pip-audit>=2.7",
     "SQLAlchemy>=2.0",
     "bcrypt>=4.0",

@@ -72,7 +72,33 @@ def scan_secrets(source_path: str, max_files: int = 400) -> list[Secret]:
                     name=name, value=value,
                     source=f"{fp.relative_to(root)}:{lineno}", kind=kind,
                 ))
+        # Whole-file pass for PEM private keys — they live on one very long,
+        # often \n-escaped line (e.g. the app's RSA_PRIVATE_PEM_STRING) that the
+        # line scanner skips. A committed private key enables direct RS/ES token
+        # forgery and RS→HS algorithm confusion.
+        for pem in _find_private_keys(text):
+            fp_key = pem[:60]
+            if ("PRIVATE_KEY", fp_key) in seen:
+                continue
+            seen.add(("PRIVATE_KEY", fp_key))
+            out.append(Secret(
+                name="RSA_PRIVATE_KEY", value=pem,
+                source=str(fp.relative_to(root)), kind="rsa_private_key",
+            ))
     return out
+
+
+_PRIVKEY_RE = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"
+    r".*?-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----",
+    re.S,
+)
+
+
+def _find_private_keys(text: str) -> list[str]:
+    # normalise \n-escaped single-line PEMs into real newlines before matching.
+    normalised = text.replace("\\n", "\n")
+    return [m.group(0) for m in _PRIVKEY_RE.finditer(normalised)]
 
 
 def jwt_secret_candidates(secrets: list[Secret]) -> list[str]:
