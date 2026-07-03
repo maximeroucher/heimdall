@@ -21,3 +21,5 @@ heimdall.local.toml
 *.local.toml
 *.local.json
 .env
+
+.DS_Store
