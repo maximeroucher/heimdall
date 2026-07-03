@@ -1,0 +1,51 @@
+[project]
+name = "heimdall-pentest"
+version = "0.1.0"
+description = "A self-discovering OWASP Top-10 pentest library for FastAPI applications."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Maxime Roucher" }]
+keywords = ["security", "pentest", "fastapi", "owasp", "appsec"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "Framework :: FastAPI",
+]
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+# White-box extras: JWT forging + dependency auditing.
+full = [
+    "PyJWT>=2.8",
+    "pip-audit>=2.7",
+    "tomli>=2.0; python_version < '3.11'",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+heimdall = "heimdall.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/maximeroucher/heimdall"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["heimdall"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008", "E501"]

@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Reports may contain sensitive target details / secrets — never commit them.
+heimdall-report/
+*-report/
+report/
+findings.json
+REPORT.md
+
+# Local target configs often hold credentials.
+heimdall.local.toml
+*.local.toml
+*.local.json
+.env
