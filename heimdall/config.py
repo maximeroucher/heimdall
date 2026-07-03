@@ -27,6 +27,17 @@ class TargetConfig:
     authorized: bool = False             # allow a non-loopback target
     make_attacker: bool = True
 
+    # -- self-provisioning: spawn a throwaway DB and insert the test data ------
+    spawn_db: bool = False               # create a throwaway sqlite DB for the target
+    spawn_db_env_var: str = "SQLITE_DB"  # env var the target reads (or DATABASE_URL)
+    spawn_db_name: str = "heimdall_testdb.sqlite"
+    spawn_db_relative: bool = True       # pass bare filename (sqlite:///./{name} apps)
+    db_url: str | None = None            # explicit throwaway DB URL (if not spawning)
+    provision_low_priv: int = 0          # >0: insert N distinct low-priv users
+    provision_admins: int = 0            # also insert N admin users
+    provision_password: str = "Heimdall!Prov#2026"
+    mint_scoped: bool = True             # mint API-scoped tokens via a cracked secret
+
     @classmethod
     def from_dict(cls, d: dict) -> "TargetConfig":
         creds = []
@@ -47,6 +58,15 @@ class TargetConfig:
             credentials=creds,
             authorized=d.get("authorized", False),
             make_attacker=d.get("make_attacker", True),
+            spawn_db=d.get("spawn_db", False),
+            spawn_db_env_var=d.get("spawn_db_env_var", "SQLITE_DB"),
+            spawn_db_name=d.get("spawn_db_name", "heimdall_testdb.sqlite"),
+            spawn_db_relative=d.get("spawn_db_relative", True),
+            db_url=d.get("db_url"),
+            provision_low_priv=d.get("provision_low_priv", 0),
+            provision_admins=d.get("provision_admins", 0),
+            provision_password=d.get("provision_password", "Heimdall!Prov#2026"),
+            mint_scoped=d.get("mint_scoped", True),
         )
 
     @classmethod

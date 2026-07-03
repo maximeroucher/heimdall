@@ -177,9 +177,12 @@ def _xss_probe(ctx: Context) -> None:
         except Exception as exc:
             ctx.note(f"XSS probe failed for {r.method} {r.path}: {exc}")
             continue
-        # Raw, un-encoded reflection of the <script> tag is the signal; an
-        # HTML-encoded (&lt;script&gt;) echo is safe and does not match.
-        if payload in resp.text:
+        # Signal = raw <script> reflected AND the response is served as HTML.
+        # A JSON API echoing the value back (the created object) is normal and
+        # not XSS, so gating on Content-Type: text/html removes that whole class
+        # of false positives; an HTML-encoded (&lt;script&gt;) echo also won't match.
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if payload in resp.text and "html" in ctype:
             reflected.append((r, payload, resp))
 
     if reflected:

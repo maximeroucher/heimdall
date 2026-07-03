@@ -31,13 +31,18 @@ from ..discovery.openapi import body_field_names
 from .base import module
 
 # Parameter/field names that commonly carry a URL the server will dereference.
+# Names that (almost) always denote a URL the server may fetch. Kept tight on
+# purpose: loose hints like "next"/"return"/"target"/"page"/"file" match filter
+# and pagination params (e.g. a boolean `returned` on a loans route) and produce
+# false SSRF. A param qualifies only by an exact match here, or a clear url/uri
+# suffix, or a webhook/callback/href substring (see ``_looks_urlish``).
 _URL_HINTS = (
-    "url", "uri", "link", "href", "src", "source", "image", "img", "image_url",
-    "avatar", "webhook", "callback", "redirect", "redirect_uri", "next",
-    "return", "dest", "destination", "feed", "target", "host", "endpoint",
-    "proxy", "fetch", "load", "remote", "document", "file", "path", "page",
-    "domain",
+    "url", "uri", "link", "href", "webhook", "callback", "redirect_uri",
+    "redirect_url", "image_url", "avatar_url", "img_url", "src", "source_url",
+    "fetch_url", "proxy_url", "callback_url", "webhook_url", "image", "avatar",
 )
+_URL_SUFFIXES = ("_url", "_uri", "url", "uri")
+_URL_SUBSTR = ("webhook", "callback", "href")
 
 # Internal targets we try to make the server reach, plus a control that should
 # fail fast for everyone. 169.254.169.254 is the near-universal cloud metadata
@@ -104,7 +109,11 @@ def run(ctx: Context) -> None:
 
 def _looks_urlish(name: str) -> bool:
     n = name.lower()
-    return any(h == n or h in n for h in _URL_HINTS)
+    if n in _URL_HINTS:
+        return True
+    if any(n.endswith(sfx) for sfx in _URL_SUFFIXES):
+        return True
+    return any(sub in n for sub in _URL_SUBSTR)
 
 
 def _discover_sinks(ctx: Context) -> list[tuple]:
@@ -181,9 +190,18 @@ def _send(ctx: Context, route, name: str, location: str, payload: str,
         body = ""
     low = body.lower()
 
-    if payload == _METADATA and any(m in low for m in _METADATA_MARKERS):
-        return "metadata", f"HTTP {resp.status_code}, metadata markers in body"
-    if any(s in low for s in _FETCH_LEAK):
+    # A 4xx means the server REJECTED the input (didn't fetch) — and its error
+    # often echoes our payload verbatim, so a rejected "…/meta-data/" URL would
+    # otherwise trip the metadata check. Only a non-error response can evidence a
+    # fetch, and metadata markers must be ones NOT present in the payload we sent
+    # (i.e. content that came from the metadata service, not our echoed URL).
+    plow = payload.lower()
+    fetched = resp.status_code < 400
+    if payload == _METADATA and fetched:
+        hits = [m for m in _METADATA_MARKERS if m in low and m not in plow]
+        if hits:
+            return "metadata", f"HTTP {resp.status_code}, metadata markers in body: {hits}"
+    if fetched and any(s in low for s in _FETCH_LEAK):
         return "fetch-leak", f"HTTP {resp.status_code}: {body[:200].strip()}"
     return "resp", resp
 
@@ -237,23 +255,12 @@ def _probe_sinks(ctx: Context, sinks: list[tuple]) -> list[dict]:
                     "internal target hung while the .invalid control returned "
                     "fast (timing divergence)", detail, critical=is_meta)
                 break
-            if kind == "resp" and control_kind == "resp":
-                # Both got HTTP responses; a meaningful status/size divergence
-                # between an internal target and the unresolvable control hints
-                # the server treated them differently (i.e. it dialed out).
-                internal_resp, control_resp = detail, control_detail
-                if _diverges(internal_resp, control_resp):
-                    record = _mk_record(
-                        route, name, location, payload,
-                        f"response to internal target diverged from the "
-                        f".invalid control "
-                        f"(internal HTTP {internal_resp.status_code}/"
-                        f"{len(internal_resp.content)}B vs control HTTP "
-                        f"{control_resp.status_code}/"
-                        f"{len(control_resp.content)}B)",
-                        f"internal={_r(internal_resp)} control={_r(control_resp)}",
-                        critical=is_meta, weak=True)
-                    break
+            # NOTE: a plain HTTP-response *divergence* between an internal URL and
+            # the .invalid control is deliberately NOT treated as SSRF — a param
+            # that merely validates/echoes its value (a filter, an enum) diverges
+            # too, which produced false CRITICALs. Only outbound-connection
+            # evidence (metadata reflection, connection-error leak, timing hang)
+            # confirms a fetch; everything else stays an unconfirmed sink below.
 
         if record is not None:
             confirmed.append(record)

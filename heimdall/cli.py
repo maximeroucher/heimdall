@@ -35,6 +35,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="login credential (repeatable)")
     ap.add_argument("--launch", help="shell command to boot the target first")
     ap.add_argument("--launch-cwd", help="cwd for --launch")
+    ap.add_argument("--spawn-db", action="store_true",
+                    help="spawn a throwaway sqlite DB for the target (needs --launch-cwd)")
+    ap.add_argument("--spawn-db-env", default="SQLITE_DB",
+                    help="env var the target reads for the DB (default SQLITE_DB)")
+    ap.add_argument("--db-url", help="throwaway DB SQLAlchemy URL to provision into "
+                                     "(if not using --spawn-db)")
+    ap.add_argument("--provision", type=int, default=0, metavar="N",
+                    help="insert N distinct low-privilege test users into the DB")
+    ap.add_argument("--provision-admins", type=int, default=0, metavar="N",
+                    help="also insert N admin test users")
+    ap.add_argument("--no-mint", action="store_true",
+                    help="do not mint API-scoped tokens even if the secret is recovered")
     ap.add_argument("--out", help="report output directory (default ./heimdall-report)")
     ap.add_argument("--only", default="", help="comma list of module keys to run")
     ap.add_argument("--skip", default="", help="comma list of module keys to skip")
@@ -74,6 +86,18 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.i_have_authorization:
         cfg.authorized = True
+    # provisioning flags (CLI overrides config)
+    if args.spawn_db:
+        cfg.spawn_db = True
+        cfg.spawn_db_env_var = args.spawn_db_env
+    if args.db_url:
+        cfg.db_url = args.db_url
+    if args.provision:
+        cfg.provision_low_priv = args.provision
+    if args.provision_admins:
+        cfg.provision_admins = args.provision_admins
+    if args.no_mint:
+        cfg.mint_scoped = False
 
     if args.discover_only:
         from .core.guardrail import assert_target_allowed

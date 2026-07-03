@@ -28,11 +28,18 @@ def _is_public_by_design(path: str, oid: str) -> bool:
     return any(h in blob for h in _PUBLIC_OK)
 
 
+def _is_self_scoped(path: str) -> bool:
+    """Routes that return the caller's OWN data (…/me, …/me/…) are not admin."""
+    segs = path.lower().split("/")
+    return "me" in segs or "myself" in segs or "current" in segs
+
+
 @module("a01", "Broken Access Control / IDOR")
 def run(ctx: Context) -> None:
     _unauth_enforcement(ctx)
     _bfla_admin(ctx)
     _idor(ctx)
+    _cross_principal_bola(ctx)
 
 
 def _unauth_enforcement(ctx: Context) -> None:
@@ -82,14 +89,17 @@ def _bfla_admin(ctx: Context) -> None:
     # A trustworthy negative needs a genuinely low-priv actor: the self-registered
     # attacker (role 'attacker', not supplied). A supplied 'user' credential may
     # secretly be over-privileged, which would turn a real BFLA into a false SAFE.
-    trustworthy = attacker.role == "attacker" and not attacker.supplied
+    # A genuine low-priv actor (self-registered attacker OR DB-provisioned user)
+    # makes these results authoritative; only *supplied* creds are of unknown level.
+    trustworthy = not attacker.supplied
     if not trustworthy:
         ctx.note(f"BFLA using supplied principal '{attacker.label}' of unverified "
-                 "privilege (no self-registered attacker available) — negatives are low-confidence")
+                 "privilege — negatives are low-confidence")
     admin_routes = [
         r for r in ctx.routes
         if r.method == "GET" and not r.has_path_param
         and any(h in f"{r.path} {r.operation_id}".lower() for h in _ADMIN_HINT)
+        and not _is_self_scoped(r.path)   # /users/me/... is caller-own, not admin
     ]
     leaked = []
     for r in admin_routes:
@@ -175,4 +185,82 @@ def _idor(ctx: Context) -> None:
                          f"{hits[0][0].path} with an id you do not own.",
             references=[REFS["ps-idor"], REFS["A01"]],
             tools=["Burp Suite (Intruder)", "Autorize", "curl"],
+        )
+
+
+def _lowpriv_pair(ctx: Context):
+    """Two distinct low-privilege principals that carry a known user id."""
+    pool = [p for p in ctx.profile.principals.values()
+            if p.authed and p.user_id and p.role in ("user", "attacker")]
+    seen, uniq = set(), []
+    for p in pool:
+        if p.user_id not in seen:
+            seen.add(p.user_id)
+            uniq.append(p)
+    return uniq[:2] if len(uniq) >= 2 else None
+
+
+def _cross_principal_bola(ctx: Context) -> None:
+    """True BOLA with real victims: using attacker A's token, fetch victim B's
+    OWN object id on every single-id route. A 2xx where a bogus id is rejected
+    proves A read an object it doesn't own — not reference data. This needs two
+    provisioned low-priv principals with known ids (see self-provisioning).
+    """
+    pair = _lowpriv_pair(ctx)
+    if not pair:
+        ctx.note("cross-principal BOLA needs 2 known low-priv users "
+                 "(provision with --provision 2); skipped")
+        return
+    attacker, victim = pair
+    bogus = "00000000-0000-0000-0000-0000000000ff"
+    id_routes = [r for r in ctx.routes
+                 if r.method == "GET" and len(r.path_params) == 1
+                 and looks_like_id_param(r.path_params[0])]
+    hits = []
+    for r in id_routes[:80]:
+        pname = r.path_params[0]
+        try:
+            own = ctx.get(r.fill_path({pname: attacker.user_id}), token=attacker.token)
+            if own.status_code >= 300:
+                continue  # route isn't usable even for the owner; skip
+            vic = ctx.get(r.fill_path({pname: victim.user_id}), token=attacker.token)
+            bog = ctx.get(r.fill_path({pname: bogus}), token=attacker.token)
+        except Exception as exc:  # noqa: BLE001
+            ctx.note(f"BOLA probe of {r.path} errored: {exc}")
+            continue
+        # A reads B's object (2xx) while a bogus id is rejected -> real BOLA.
+        if vic.status_code < 300 and bog.status_code >= 400:
+            hits.append((r, vic.status_code, len(vic.content)))
+    if hits:
+        sample = "\n".join(
+            f"  GET {r.path} [victim id] -> {code} ({size}B); bogus id rejected"
+            for r, code, size in hits[:20]
+        )
+        ctx.finding(
+            id="a01-cross-principal-bola",
+            owasp="A01", severity="HIGH",
+            title=f"BOLA: low-priv user reads other users' objects on {len(hits)} route(s)",
+            summary=(
+                f"Authenticated as '{attacker.label}', Heimdall fetched objects belonging to "
+                f"a different user ('{victim.label}') by id and received success, while the "
+                "same route rejects a non-existent id — so the handler resolves and returns "
+                "another user's object without an ownership check (true object-level "
+                "authorization bypass). Empty bodies still count: the victim simply may hold "
+                "no rows for that resource."
+            ),
+            evidence=sample,
+            reproduction=(
+                f"Log in as user A ({attacker.email}), then GET "
+                f"{hits[0][0].path} substituting user B's id — returns 2xx instead of 403."
+            ),
+            references=[REFS["ps-idor"], REFS["A01"], REFS["cheat-authz"]],
+            tools=["Burp Suite (Autorize)", "curl"],
+        )
+    else:
+        ctx.finding(
+            id="a01-cross-principal-bola",
+            owasp="A01", severity="SAFE",
+            title="Object-by-id routes enforce ownership across users",
+            summary=f"Using two distinct low-priv accounts, no single-id GET route let "
+                    f"'{attacker.label}' read '{victim.label}''s objects while rejecting bogus ids.",
         )

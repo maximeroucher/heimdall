@@ -56,10 +56,25 @@ def run(
 
     assert_target_allowed(config.base_url, config.authorized)
 
+    # Spawn a throwaway DB the target will use, so Heimdall can insert test data.
+    testdb = None
+    launch_env = dict(config.launch_env)
+    db_url = config.db_url
+    if config.spawn_db:
+        from .bootstrap import testdb as testdb_mod
+        if not config.launch_cwd:
+            raise SystemExit("[!] spawn_db requires launch_cwd (where the sqlite file lives)")
+        testdb = testdb_mod.spawn_sqlite(
+            config.launch_cwd, name=config.spawn_db_name,
+            env_var=config.spawn_db_env_var, relative_filename=config.spawn_db_relative)
+        launch_env.update(testdb.launch_env)
+        db_url = testdb.connect_url
+        print(f"[*] spawned throwaway DB: {testdb.path}")
+
     proc = None
     if config.launch:
         print(f"[*] launching target: {config.launch}")
-        proc = server.launch(config.launch, cwd=config.launch_cwd, env=config.launch_env)
+        proc = server.launch(config.launch, cwd=config.launch_cwd, env=launch_env)
     try:
         if not server.wait_for_server(config.base_url, timeout=60):
             raise SystemExit(f"[!] target {config.base_url} never became reachable")
@@ -72,6 +87,10 @@ def run(
         print("\n[*] bootstrapping principals…")
         principals = bootstrap_principals(
             profile, config.credentials, make_attacker=config.make_attacker)
+
+        if config.provision_low_priv or config.provision_admins:
+            _provision(config, profile, principals, db_url)
+
         authed = [k for k, p in principals.items() if p.authed]
         print(f"[*] authenticated principals: {authed or 'none'}")
 
@@ -117,3 +136,44 @@ def run(
     finally:
         if proc is not None:
             proc.terminate()
+        if testdb is not None:
+            testdb.remove()
+
+
+def _provision(config, profile, principals: dict, db_url: str | None) -> None:
+    """Insert low-priv / admin test users into the throwaway DB and, when a
+    signing secret is recoverable, mint them API-scoped tokens so they can
+    actually exercise the authenticated API."""
+    from .bootstrap import minting
+    from .bootstrap.provision import ProvisionRequest, provision
+
+    req = ProvisionRequest(
+        low_priv=config.provision_low_priv,
+        admins=config.provision_admins,
+        password=config.provision_password,
+        db_url=db_url,
+    )
+    print(f"[*] self-provisioning {req.low_priv} low-priv + {req.admins} admin user(s)…")
+    res = provision(profile, req)
+    for n in res.notes:
+        print(f"      · {n}")
+
+    secret = None
+    scopes = ""
+    if config.mint_scoped:
+        template = next((p.token for p in principals.values() if p.token), None) \
+            or next((p.token for p in res.principals if p.token), None)
+        if template:
+            secret = minting.recover_secret(profile, template)
+            scopes = minting.declared_scopes(profile)
+            if secret:
+                print(f"[*] signing secret recovered → minting {scopes or 'default'}-scoped "
+                      "tokens for provisioned users")
+
+    for p in res.principals:
+        if secret and p.token and scopes:
+            minted = minting.mint(p.token, secret, sub=p.user_id, scopes=scopes)
+            if minted:
+                p.token = minted
+                p.extra["minted_scopes"] = scopes
+        principals[p.label] = p
