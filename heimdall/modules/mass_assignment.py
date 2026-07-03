@@ -1,19 +1,24 @@
 """A01 / API3 — Mass assignment (broken object property-level authorization).
 
-An endpoint that binds the request body straight onto a model accepts *more*
-than the fields it documents: send ``is_admin: true`` or ``role: "admin"`` to a
-profile-update or signup endpoint and, if the server binds it, you've granted
-yourself privileges the API never meant to expose. This is the write side of
-property-level authorization (OWASP API3) — and it's broader than the two spots
-already covered (a07 signup, a01 self-escalation on ``/me``): it applies to
-*every* create/update endpoint.
+An endpoint that binds the request body straight onto its model accepts *more*
+than the fields it documents as input — so a client can set fields the server was
+supposed to own (a role, an approval flag, an owner id, a balance).
 
-Detection is confirmation-based, not guesswork: inject privileged fields the
-endpoint does **not** declare, using distinctive marker values that could only
-come from us (``role: "heimdall_root"``, ``balance: 1337421``), then check
-whether the response reflects that marker back — proof the server accepted and
-stored the unexpected field. Only extra (undeclared) fields are injected, and it
-writes objects, so it's FULL-mode only.
+Detection is HINT-FREE — no hardcoded "privileged field" name list (the discipline
+the race/workflow/business-logic modules follow). The app itself tells us which
+fields are server-controlled: they appear in the endpoint's **response** schema
+but not in its **request** schema. Those are exactly the properties a client
+should not be able to write. So:
+
+  1. Structurally diff response-fields − request-fields → the server-controlled
+     properties (derived from the app's OpenAPI, not guessed).
+  2. Create the object once to learn each such field's type, then create it again
+     injecting a type-matched distinctive value into every server-controlled field.
+  3. If the object comes back carrying our injected value, the server bound a
+     field it never declared as input — confirmed mass assignment.
+
+This catches whatever the app over-binds (is_admin, owner_id, an app-specific
+internal_status …) without naming any of them. Writes objects → FULL mode only.
 """
 
 from __future__ import annotations
@@ -26,31 +31,9 @@ from ..core.taxonomy import REFS
 from ..discovery.openapi import body_field_names
 from .base import module
 
-# Privileged fields with distinctive marker values. Booleans use True; the
-# string/number markers are unguessable so a reflection is unambiguous proof.
-_MARK_S = "heimdall_root"
-_MARK_OWN = "heimdall-owns-9e3f"
-_MARK_STATUS = "heimdall_pwned"
-_MARK_N = 1337421
-
-_PRIV_FIELDS: dict = {
-    "is_admin": True, "is_superuser": True, "is_staff": True, "admin": True,
-    "superuser": True, "is_active": True, "is_verified": True, "verified": True,
-    "email_verified": True, "is_approved": True, "approved": True,
-    "is_premium": True, "is_confirmed": True, "is_owner": True,
-    "role": _MARK_S, "account_type": _MARK_S, "user_role": _MARK_S,
-    "permissions": [_MARK_S], "scopes": [_MARK_S],
-    "balance": _MARK_N, "credit": _MARK_N, "wallet_balance": _MARK_N,
-    "owner_id": _MARK_OWN, "user_id": _MARK_OWN, "created_by": _MARK_OWN,
-    "status": _MARK_STATUS,
-}
-# Which persisted fields are privilege/financial (HIGH) vs ownership (MEDIUM).
-_HIGH_KEYS = {"is_admin", "is_superuser", "is_staff", "admin", "superuser",
-              "role", "account_type", "user_role", "permissions", "scopes",
-              "is_verified", "verified", "email_verified", "is_approved",
-              "approved", "is_active", "balance", "credit", "wallet_balance"}
-_MARKERS = {_MARK_S, _MARK_OWN, _MARK_STATUS, _MARK_N}
-_MAX_ROUTES = 25
+_MARK_STR = "heimdall_ma"
+_MARK_NUM = 1337421
+_MAX_ROUTES = 30
 
 
 @module("mass-assignment", "Mass Assignment", destructive=True)
@@ -59,24 +42,31 @@ def run(ctx: Context) -> None:
         ctx.note("mass-assignment: skipped (writes objects; FULL mode only)")
         return
     token = _actor_token(ctx)
-    routes = [r for r in ctx.routes if r.method in ("POST", "PUT", "PATCH")
-              and (r.body_schema or {}).get("properties")][:_MAX_ROUTES]
+    routes = _discover(ctx)
     if not routes:
-        ctx.note("mass-assignment: no writable endpoints with a body schema")
+        ctx.note("mass-assignment: no endpoints expose server-only fields to test")
         return
 
     hits: list[dict] = []
-    probed = 0
-    for r in routes:
-        probed += 1
-        _probe(ctx, r, token, hits)
+    tested = unreached = 0
+    for route, cands in routes[:_MAX_ROUTES]:
+        outcome = _probe(ctx, route, cands, token)
+        if outcome == "unreached":
+            unreached += 1
+        elif outcome == "clean":
+            tested += 1
+        elif isinstance(outcome, dict):
+            tested += 1
+            hits.append(outcome)
 
-    ctx.note(f"mass-assignment: probed {probed} write endpoint(s); "
-             f"{len(hits)} bound an undeclared privileged field")
+    ctx.note(f"mass-assignment: tested {tested} endpoint(s) for over-binding of "
+             f"server-only fields; {len(hits)} bound one, {unreached} unreachable")
     if hits:
         _report(ctx, hits)
-    elif probed:
-        _report_safe(ctx, probed)
+    elif tested:
+        _report_safe(ctx, tested, unreached)
+    elif unreached:
+        _report_untested(ctx, unreached)
 
 
 def _actor_token(ctx: Context) -> str | None:
@@ -84,136 +74,132 @@ def _actor_token(ctx: Context) -> str | None:
     return princ.token if princ and princ.authed else None
 
 
-def _probe(ctx, route, token, hits: list[dict]) -> None:
-    declared = set(body_field_names(route))
-    # Only inject fields the endpoint does NOT already declare — that's what
-    # makes it *mass* assignment rather than intended input.
-    inject = {k: v for k, v in _PRIV_FIELDS.items() if k not in declared}
-    if not inject:
-        return
+# ── discovery (structural schema diff — no names inspected) ──────────────────
+
+def _discover(ctx: Context) -> list[tuple]:
+    """Pair each write endpoint with the server-controlled fields it exposes:
+    response properties that are NOT request properties."""
+    out = []
+    for r in ctx.routes:
+        if r.method not in ("POST", "PUT", "PATCH"):
+            continue
+        req = {f.lower() for f in body_field_names(r)}
+        cands = [f for f in r.response_fields if f.lower() not in req]
+        if req and cands:            # needs a real request body AND server-only fields
+            out.append((r, cands))
+    return out
+
+
+# ── probing (behavioural: inject server-only fields, confirm persistence) ────
+
+def _fire(ctx, route, token, overrides):
     path = route.fill_path({p: "1" for p in route.path_params})
-    data = _send(ctx, route, path, token, inject)
-    if data is None:
-        return
-
-    injected_bools = {k for k, v in inject.items() if v is True}
-    # Distinctive string/number markers echoed back are unambiguous proof.
-    markers = _marker_hits(data)
-    # Boolean flags are ambiguous (the value may just be the model default), so
-    # CONFIRM control with a differential: resend the same booleans as False and
-    # require the response to track our input (True→true earlier, now False→false).
-    bool_hits = []
-    bool_candidates = _bool_true_hits(data, injected_bools)
-    if bool_candidates:
-        inject_false = {k: (False if k in injected_bools else v)
-                        for k, v in inject.items()}
-        data2 = _send(ctx, route, path, token, inject_false)
-        if data2 is not None:
-            vals2 = {kp: v for kp, _k, v in _walk(data2)}
-            bool_hits = [(kp, True) for kp in bool_candidates
-                         if vals2.get(kp) is False]  # value followed our input
-
-    bound = _dedup(markers + bool_hits)
-    if bound:
-        hits.append({"route": route, "bound": bound})
-
-
-def _send(ctx, route, path, token, inject):
     try:
-        _, body = build_request(ctx, route, token, overrides=inject)
+        _, body = build_request(ctx, route, token, overrides=overrides)
         resp = ctx.request(route.method, path, token=token, json=body,
                            timeout=12, retry_429=False)
     except requests.RequestException:
         return None
-    if resp.status_code >= 400:
-        return None
+    return resp
+
+
+def _obj(resp):
     try:
-        return resp.json()
+        data = resp.json()
     except Exception:  # noqa: BLE001
         return None
+    if isinstance(data, dict):
+        # unwrap a single-object envelope if present
+        for k in ("data", "item", "result", "object"):
+            if isinstance(data.get(k), dict):
+                return data[k]
+        return data
+    return None
 
 
-def _marker_hits(data) -> list[tuple]:
-    out = []
-    for keypath, _key, value in _walk(data):
-        if value in _MARKERS or (isinstance(value, list) and _MARK_S in value):
-            out.append((keypath, value))
-    return out
+def _distinctive(value):
+    """A type-matched value that can only have come from us, or None to skip."""
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, str):
+        return _MARK_STR
+    if isinstance(value, (int, float)):
+        return _MARK_NUM
+    return None
 
 
-def _bool_true_hits(data, injected_bools: set) -> list[str]:
-    return [kp for kp, key, value in _walk(data)
-            if key in injected_bools and value is True]
+def _probe(ctx, route, cands, token):
+    # Phase 1: baseline create to learn the server-controlled fields' types.
+    r0 = _fire(ctx, route, token, {})
+    if r0 is None or r0.status_code >= 400:
+        return "unreached"
+    o0 = _obj(r0)
+    if not o0:
+        return "unreached"
+    inject = {}
+    for c in cands:
+        if c in o0:
+            d = _distinctive(o0[c])
+            if d is not None and d != o0[c]:
+                inject[c] = d
+    if not inject:
+        return "clean"               # server-only fields absent/untypable in output
 
-
-def _dedup(pairs: list[tuple]) -> list[tuple]:
-    seen, out = set(), []
-    for kp, v in pairs:
-        if kp not in seen:
-            seen.add(kp)
-            out.append((kp, v))
-    return out
-
-
-def _walk(obj, prefix="", depth=0):
-    if depth > 6:
-        return
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            kp = f"{prefix}.{k}" if prefix else str(k)
-            if isinstance(v, (dict, list)):
-                yield from _walk(v, kp, depth + 1)
-            else:
-                yield kp, str(k), v
-    elif isinstance(obj, list):
-        for item in obj[:20]:
-            yield from _walk(item, prefix + "[]", depth + 1)
+    # Phase 2: create again, injecting a distinctive value into every such field.
+    r1 = _fire(ctx, route, token, inject)
+    if r1 is None or r1.status_code >= 400:
+        return "clean"               # rejected the injected fields → not bound
+    o1 = _obj(r1)
+    if not o1:
+        return "clean"
+    bound = [(c, o0.get(c), o1[c]) for c, v in inject.items()
+             if c in o1 and o1[c] == v and o1[c] != o0.get(c)]
+    if bound:
+        return {"route": route, "bound": bound}
+    return "clean"
 
 
 # ── findings ─────────────────────────────────────────────────────────────────
 
-def _is_high(bound: list[tuple]) -> bool:
-    return any(kp.split(".")[-1] in _HIGH_KEYS for kp, _v in bound)
-
-
 def _report(ctx: Context, hits: list[dict]) -> None:
-    high = any(_is_high(h["bound"]) for h in hits)
-    lead = next((h for h in hits if _is_high(h["bound"])), hits[0])
+    lead = hits[0]
     r = lead["route"]
     lines = []
     for h in hits[:15]:
         hr = h["route"]
-        fields = ", ".join(f"{kp}={v}" for kp, v in h["bound"][:5])
-        lines.append(f"  {hr.method} {hr.path}  bound → {fields}")
+        fields = ", ".join(f"{c} ({old}→{new})" for c, old, new in h["bound"][:5])
+        lines.append(f"  {hr.method} {hr.path}  bound server-only field(s): {fields}")
+    all_fields = sorted({c for h in hits for c, _o, _n in h["bound"]})
+    lead_fields = ", ".join(c for c, _o, _n in lead["bound"][:3])
     ctx.finding(
         id="a01-mass-assignment",
-        owasp="A01", severity="HIGH" if high else "MEDIUM",
-        title=(f"Mass assignment on {r.method} {r.path} "
-               f"(bound undeclared {lead['bound'][0][0].split('.')[-1]})"
-               + (f" (+{len(hits) - 1} more)" if len(hits) > 1 else "")),
+        owasp="A01", severity="HIGH",
+        title=(f"Mass assignment on {r.method} {r.path} — client-writable "
+               f"server field(s): {lead_fields}"
+               + (f" (+{len(hits) - 1} more endpoint(s))" if len(hits) > 1 else "")),
         summary=(
-            "The endpoint bound request-body fields it never declares onto its "
-            "model: privileged properties injected with unguessable marker values "
-            "came back in the response, proving the server accepted and stored "
-            "them. "
-            + ("A client can set is_admin / role / verified / balance on itself — "
-               "privilege escalation, moderation bypass, or financial tampering "
-               "in a single request. "
-               if high else
-               "A client can reassign ownership fields (owner_id/user_id) it "
-               "shouldn't control. ")
-            + "Bind an explicit allow-list of writable fields (a dedicated "
-            "Pydantic input schema per endpoint — never the ORM model / a shared "
-            "schema), and set server-controlled fields server-side only."
+            "The endpoint bound request-body fields it never declares as input: "
+            "properties that appear only in its response schema (server-controlled "
+            "— set by the server, not the client) were writable, and our injected "
+            "values persisted. These are the fields the API author chose to expose "
+            "as output-only, so being able to set them is a property-level "
+            "authorization break. Its severity depends on which field — writing an "
+            "authorization flag (is_admin/role/verified), an ownership id, or a "
+            "balance is privilege escalation / takeover / financial tampering; the "
+            f"over-bound fields here are: {', '.join(all_fields)}. Fix: bind an "
+            "explicit per-endpoint input schema (a dedicated Pydantic model with "
+            "only the client-writable fields — never the ORM model or a shared "
+            "schema) and set server-owned fields server-side only."
         ),
         evidence="\n".join(lines),
         route=f"{r.method} {r.path}",
-        request=f"{r.method} {r.path}  (body + undeclared {lead['bound'][0][0].split('.')[-1]})",
+        request=f"{r.method} {r.path}  (body + server-only field {lead['bound'][0][0]})",
         reproduction=(
-            f"Send {r.method} {r.path} with the normal body plus "
-            f"'{lead['bound'][0][0].split('.')[-1]}' set to a privileged value; "
-            f"the response reflects it, confirming the server bound the "
-            f"undeclared field."
+            f"Create via {r.method} {r.path} once to see the server-set fields in "
+            f"the response, then create again with '{lead['bound'][0][0]}' set in "
+            f"the body; the response comes back carrying your value "
+            f"({lead['bound'][0][1]} → {lead['bound'][0][2]}), proving the server "
+            "bound a field it doesn't declare as input."
         ),
         references=[REFS["A01"], REFS["api3"], REFS["ps-massassign"],
                     "https://cheatsheetseries.owasp.org/cheatsheets/"
@@ -222,18 +208,35 @@ def _report(ctx: Context, hits: list[dict]) -> None:
     )
 
 
-def _report_safe(ctx: Context, probed: int) -> None:
+def _report_safe(ctx: Context, tested: int, unreached: int) -> None:
     ctx.finding(
         id="a01-mass-assignment-safe",
         owasp="A01", severity="SAFE",
-        title="Write endpoints ignore undeclared privileged fields",
+        title="Server-controlled fields are not client-writable",
         summary=(
-            f"Injected undeclared privileged fields (is_admin, role, verified, "
-            f"balance, owner_id, …) with marker values into {probed} write "
-            "endpoint(s); none were reflected back, consistent with explicit "
-            "input schemas that drop unexpected fields. Endpoints whose response "
-            "doesn't echo the object can't be confirmed this way — re-fetch those "
-            "objects manually to be sure."
+            f"For {tested} write endpoint(s), injected distinctive values into "
+            "every field the response exposes but the request schema does not "
+            "(the server-controlled properties); none persisted, consistent with "
+            "explicit input schemas that drop undeclared fields. "
+            + (f"{unreached} endpoint(s) couldn't be exercised. " if unreached else "")
+            + "Endpoints whose response doesn't echo the object can't be confirmed "
+            "this way — re-fetch those manually."
         ),
         references=[REFS["A01"], REFS["api3"], REFS["ps-massassign"]],
+    )
+
+
+def _report_untested(ctx: Context, unreached: int) -> None:
+    ctx.finding(
+        id="a01-mass-assignment-untested",
+        owasp="A01", severity="INFO",
+        title=f"{unreached} endpoint(s) with server-only fields not exercised",
+        summary=(
+            f"Found {unreached} write endpoint(s) exposing server-controlled fields, "
+            "but the baseline create/update didn't succeed (preconditions / related "
+            "resources / authorization black-box synthesis couldn't satisfy), so "
+            "over-binding wasn't tested — not a clean bill of health. Re-run with "
+            "valid prerequisites or test these manually."
+        ),
+        references=[REFS["A01"], REFS["api3"]],
     )
