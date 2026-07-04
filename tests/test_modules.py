@@ -135,6 +135,24 @@ def test_detect_db_env_vars_and_build_launch_env():
     assert env["MONGO_URL"].endswith("authSource=admin")
 
 
+def test_file_upload_static_mount_detection(tmp_path):
+    """StaticFiles mount prefixes are detected from source (so a served-back
+    upload can be confirmed as stored XSS) plus common conventions."""
+    from heimdall.core.context import Context
+    from heimdall.core.model import AppProfile
+    from heimdall.modules import file_upload as fu
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "main.py").write_text(
+        "from fastapi.staticfiles import StaticFiles\n"
+        "app.mount('/media/uploads', StaticFiles(directory='up'), name='up')\n")
+    ctx = Context(AppProfile(base_url="http://x", source_path=str(src)))
+    pfx = fu._static_mount_prefixes(ctx)
+    assert "/media/uploads" in pfx          # source-detected mount
+    assert "/static" in pfx                 # common default
+
+
 def test_looks_like_id_param():
     assert looks_like_id_param("user_id")
     assert looks_like_id_param("id")

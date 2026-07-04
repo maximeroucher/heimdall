@@ -23,6 +23,7 @@ Everything the module uploads is a harmless canary; nothing is executed.
 
 from __future__ import annotations
 
+import os
 import re
 
 import requests
@@ -70,12 +71,14 @@ def run(ctx: Context) -> None:
                  "(writes; FULL mode only)")
         return
 
+    static_prefixes = _static_mount_prefixes(ctx)
     confirmed: list[dict] = []
     accepted: list[dict] = []
     probed = 0
     for route, file_field, form_fields in routes[:_MAX_ROUTES]:
         probed += 1
-        _probe_route(ctx, route, file_field, form_fields, token, confirmed, accepted)
+        _probe_route(ctx, route, file_field, form_fields, token, confirmed, accepted,
+                     static_prefixes)
 
     ctx.note(f"file-upload: probed {probed} endpoint(s); {len(confirmed)} confirmed "
              f"served-back active content, {len(accepted)} accepted a dangerous type")
@@ -122,7 +125,8 @@ def _upload_routes(ctx: Context) -> list[tuple]:
 
 # ── probing ──────────────────────────────────────────────────────────────────
 
-def _probe_route(ctx, route, file_field, form_fields, token, confirmed, accepted):
+def _probe_route(ctx, route, file_field, form_fields, token, confirmed, accepted,
+                 static_prefixes):
     path = route.fill_path({p: "1" for p in route.path_params})
     data = {f: _CANARY for f in form_fields}
     for filename, blob, ctype, tag in _payload_files():
@@ -138,7 +142,7 @@ def _probe_route(ctx, route, file_field, form_fields, token, confirmed, accepted
         rec = {"route": route, "tag": tag, "filename": filename,
                "ctype": ctype, "status": resp.status_code}
         # Try to confirm it's served back as active content.
-        served = _confirm_served(ctx, resp, token)
+        served = _confirm_served(ctx, resp, token, filename, static_prefixes)
         if served:
             rec["served"] = served
             confirmed.append(rec)
@@ -146,19 +150,64 @@ def _probe_route(ctx, route, file_field, form_fields, token, confirmed, accepted
             accepted.append(rec)
 
 
+# static-file mount prefixes an upload is commonly served back from — an uploaded
+# .html/.svg served here with a renderable Content-Type is stored XSS.
+_COMMON_STATIC = ("/static", "/uploads", "/upload", "/media", "/files", "/file",
+                  "/public", "/assets", "/img", "/images", "/storage", "")
+_STATIC_MOUNT_RE = re.compile(
+    r"""\.mount\(\s*["']([^"']+)["'][^)]*StaticFiles""", re.IGNORECASE | re.DOTALL)
+
+
+def _static_mount_prefixes(ctx: Context) -> list[str]:
+    """Where uploads might be served from — StaticFiles mounts detected in source
+    (`app.mount("/static", StaticFiles(...))`) plus common conventions."""
+    prefixes = list(_COMMON_STATIC)
+    src = getattr(ctx.profile, "source_path", None)
+    if src and os.path.isdir(src):
+        found = 0
+        for dp, dn, fn in os.walk(src):
+            dn[:] = [d for d in dn if not d.startswith(".") and d not in
+                     ("node_modules", "venv", ".venv", "__pycache__", "site-packages")]
+            for f in fn:
+                if not f.endswith(".py"):
+                    continue
+                try:
+                    txt = open(os.path.join(dp, f), encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+                for m in _STATIC_MOUNT_RE.finditer(txt):
+                    p = m.group(1).rstrip("/")
+                    if p and p not in prefixes:
+                        prefixes.insert(0, p)   # source-detected mount wins
+                found += 1
+                if found >= 400:
+                    return prefixes
+    return prefixes
+
+
 _URL_RE = re.compile(r'https?://[^\s"\'<>]+|/[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{2,5}')
 
 
-def _confirm_served(ctx: Context, upload_resp, token) -> dict | None:
-    """If the upload response reveals a URL/path to the stored file, fetch it and
-    check whether our canary comes back with a renderable Content-Type."""
+def _confirm_served(ctx: Context, upload_resp, token, filename: str = "",
+                    static_prefixes: list | None = None) -> dict | None:
+    """If the stored file is reachable, fetch it and check whether our canary
+    comes back with a renderable Content-Type (stored XSS). Candidate URLs come
+    from the upload response body AND from the stored filename joined to common /
+    source-detected StaticFiles mount prefixes."""
     try:
         body = upload_resp.text or ""
     except Exception:  # pragma: no cover - defensive
         return None
     cand = [m for m in _URL_RE.findall(body)
             if any(h in m.lower() for h in ("heimdall", "upload", "file", "photo", "media"))]
-    for url in cand[:4]:
+    # a bare filename in the response (`{"filename": "x.html"}`) served under a
+    # static mount — try each candidate prefix.
+    base = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if base:
+        for pfx in (static_prefixes or _COMMON_STATIC):
+            cand.append(f"{pfx}/{base}")
+    seen = set()
+    for url in [c for c in cand if not (c in seen or seen.add(c))][:14]:
         try:
             path = url if url.startswith("http") else url
             r = ctx.get(path, token=token, timeout=10, retry_429=False)
