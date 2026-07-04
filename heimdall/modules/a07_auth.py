@@ -61,6 +61,8 @@ def _login_attempt(ctx: Context, ident: str, pw: str, *, headers: dict | None = 
         if a.login_style == "oauth_password":
             body["grant_type"] = "password"
         return ctx.post(a.login_path, data=body, headers=headers, retry_429=False)
+    if a.login_wrapper:
+        body = {a.login_wrapper: body}   # {"user": {...}} envelope
     return ctx.post(a.login_path, json=body, headers=headers, retry_429=False)
 
 
@@ -280,7 +282,10 @@ def _register(ctx: Context, email: str, password: str, extra: dict | None = None
         body.update(extra)
     if a.login_style in ("form", "oauth_password"):
         return ctx.post(a.register_path, data=body)
-    return ctx.post(a.register_path, json=body)
+    # Honour a nested credential envelope ({"user": {...}}) — the injected
+    # privileged fields must land inside the wrapper to be mass-assigned.
+    payload = {a.register_wrapper: body} if a.register_wrapper else body
+    return ctx.post(a.register_path, json=payload)
 
 
 def _mass_assignment(ctx: Context) -> None:
@@ -327,11 +332,13 @@ def _mass_assignment(ctx: Context) -> None:
         return
 
     try:
+        from ..bootstrap.principals import _extract_token
         login = _login_attempt(ctx, email, password)
         token = None
         if login.status_code < 300:
             data = login.json() if login.content else {}
-            token = data.get(ctx.auth.token_response_field) if isinstance(data, dict) else None
+            # nested envelope aware ({"user":{"token":..}}) — not just token_response_field
+            token = _extract_token(data) if isinstance(data, dict) else None
         if not token:
             ctx.note(f"mass-assignment: could not log in as new account (HTTP "
                      f"{login.status_code}); verification skipped")

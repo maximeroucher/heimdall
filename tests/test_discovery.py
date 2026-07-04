@@ -150,11 +150,14 @@ def test_is_me_path_matches_segments_not_substrings():
     assert auth_detect._is_me_path("/users/me") is True
     assert auth_detect._is_me_path("/api/v1/whoami") is True
     assert auth_detect._is_me_path("/account/self") is True
+    assert auth_detect._is_me_path("/api/user") is True       # RealWorld current-user
     # ...but a substring like "me" inside "menu" must NOT (this picked /menu on DVR,
     # a public route, which then poisoned the JWT acceptance oracle).
     assert auth_detect._is_me_path("/menu") is False
     assert auth_detect._is_me_path("/members") is False
     assert auth_detect._is_me_path("/home") is False
+    assert auth_detect._is_me_path("/users") is False         # plural list, not "me"
+    assert auth_detect._is_me_path("/api/users") is False
 
 
 def test_register_schema_and_required_fields_captured():

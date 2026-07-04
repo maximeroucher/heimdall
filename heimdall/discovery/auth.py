@@ -18,7 +18,7 @@ from .openapi import body_field_names
 _LOGIN_HINTS = ("login", "token", "signin", "sign-in", "authenticate", "session")
 _LOGIN_NEG = ("refresh", "revoke", "logout", "reset", "forgot", "verify", "authorize")
 _REGISTER_HINTS = ("register", "signup", "sign-up", "users/create", "account")
-_ME_SEGMENTS = ("me", "whoami", "self", "current-user", "current_user")
+_ME_SEGMENTS = ("me", "whoami", "self", "current-user", "current_user", "user")
 _USER_FIELDS = ("username", "email", "login", "user")
 _PASS_FIELDS = ("password", "passwd", "pass", "secret")
 
@@ -192,7 +192,8 @@ def detect_auth(rm: RouteMap) -> AuthProfile:
     # -- "me" endpoint ---------------------------------------------------------
     # Prefer the least-nested current-user route (core /users/me over a
     # module-scoped /loans/users/me, which needs extra scope and misleads probes).
-    me_hits = [r.path for r in rm.by_method("GET") if _is_me_path(r.path)]
+    me_hits = [r.path for r in rm.by_method("GET")
+               if _is_me_path(r.path) and not r.path_params]
     if me_hits:
         ap.me_path = min(me_hits, key=lambda p: (p.count("/"), len(p)))
 
