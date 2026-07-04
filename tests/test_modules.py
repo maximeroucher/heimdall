@@ -222,6 +222,19 @@ def test_open_redirect_matches_effective_nav_host_not_substring():
     assert not hit(Resp(200, body=f"<p>never visit {C}</p>"))          # mention, no redirect
 
 
+def test_provision_admin_where_uses_boolean_literals():
+    """The admin-flag filter must use SQL TRUE/FALSE, not 1/0 — Postgres rejects
+    `boolean = integer`, which broke --provision on every Postgres app with a
+    boolean admin column (SQLite/MySQL coerced, so it went unnoticed)."""
+    from heimdall.bootstrap.provision import _admin_where
+
+    assert _admin_where("is_superuser", True) == ' WHERE "is_superuser" = TRUE'
+    assert _admin_where("is_superuser", False) == ' WHERE "is_superuser" = FALSE'
+    assert _admin_where(None, True) == ""       # no admin flag → no filter
+    # never emit an integer literal that Postgres would reject against a boolean
+    assert "= 1" not in _admin_where("f", True) and "= 0" not in _admin_where("f", False)
+
+
 def test_data_exposure_public_metadata_kid_not_a_leak(tmp_path):
     """A high-entropy `kid` (public Key ID) on JWKS / OpenID-discovery is public
     by design, not a data leak; but a PRIVATE JWK component (d/p/q) published in a

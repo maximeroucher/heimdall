@@ -90,6 +90,15 @@ def _bcrypt_hash(password: str) -> str:
     return bcrypt.hashpw(password.encode()[:72], bcrypt.gensalt()).decode()
 
 
+def _admin_where(flag: str | None, want_admin: bool) -> str:
+    """A ``WHERE admin_flag = …`` clause that filters by admin status. Uses SQL
+    TRUE/FALSE literals, NOT 1/0 — Postgres rejects ``boolean = integer`` (while
+    SQLite/MySQL accept TRUE/FALSE), so provisioning stays cross-dialect."""
+    if not flag:
+        return ""
+    return f' WHERE "{flag}" = {"TRUE" if want_admin else "FALSE"}'
+
+
 def _find_user_table(insp, override: str | None) -> tuple[str, dict]:
     """Return (table, {role: colname}) for the authenticatable user table."""
     candidates = []
@@ -166,7 +175,7 @@ def _provision_via_db(profile: AppProfile, req: ProvisionRequest,
         email_col = roles["email"]
 
         def _modal_domain(want_admin: bool) -> str | None:
-            where = f' WHERE "{flag}" = {1 if want_admin else 0}' if flag else ""
+            where = _admin_where(flag, want_admin)
             rows = conn.execute(
                 text(f'SELECT "{email_col}" FROM "{table}"{where}')).scalars().all()
             doms: dict[str, int] = {}
@@ -177,7 +186,7 @@ def _provision_via_db(profile: AppProfile, req: ProvisionRequest,
             return max(doms, key=doms.get) if doms else None
 
         def template(want_admin: bool):
-            where = f' WHERE "{flag}" = {1 if want_admin else 0}' if flag else ""
+            where = _admin_where(flag, want_admin)
             dom = _modal_domain(want_admin)
             row = None
             if dom:
