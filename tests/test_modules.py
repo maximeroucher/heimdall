@@ -51,6 +51,39 @@ def test_data_exposure_token_expected_on_auth_route():
     assert de._sensitive("access_token", "Summer2024!", True, {"Summer2024!"}) is not None
 
 
+def test_extract_token_nested_envelopes():
+    """A nested {"token": {"access_token": …}} envelope yields the STRING token,
+    never the inner dict."""
+    from heimdall.bootstrap.principals import _extract_token
+
+    assert _extract_token({"access_token": "abc"}) == "abc"
+    assert _extract_token({"token": {"access_token": "abc", "refresh_token": "r"}}) == "abc"
+    assert _extract_token({"data": {"token": {"access_token": "abc"}}}) == "abc"
+    assert _extract_token({"token": {"foo": "bar"}}) is None
+    r = _extract_token({"token": {"access_token": "abc"}})
+    assert isinstance(r, str)
+
+
+def test_decode_jwt_rejects_non_string():
+    from heimdall.discovery.auth import decode_jwt
+
+    assert decode_jwt({"access_token": "x"}) is None
+    assert decode_jwt(None) is None
+    assert decode_jwt("not.a.jwt.here.xx") is None
+
+
+def test_openapi_versioned_candidates_and_scrape_regex():
+    """Versioned openapi paths are candidates, and the docs-scrape regex extracts
+    a custom openapi_url from Swagger/ReDoc HTML."""
+    from heimdall.discovery.openapi import OPENAPI_CANDIDATES, _OPENAPI_HREF_RE
+
+    assert "/v1/openapi.json" in OPENAPI_CANDIDATES
+    m = _OPENAPI_HREF_RE.search("const ui = SwaggerUIBundle({url: '/v1/openapi.json'})")
+    assert m and m.group(1) == "/v1/openapi.json"
+    m2 = _OPENAPI_HREF_RE.search('<redoc spec-url="/api/v2/openapi.json"></redoc>')
+    assert m2 and m2.group(1) == "/api/v2/openapi.json"
+
+
 def test_detect_db_kind():
     """The DB engine is detected from the driver package or a connection URL, so
     Heimdall can spawn the matching throwaway on its own."""

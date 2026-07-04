@@ -215,6 +215,8 @@ def _b64url_decode(seg: str) -> bytes:
 
 def decode_jwt(token: str) -> tuple[dict, dict] | None:
     """Return (header, claims) without verifying. None if not a JWT."""
+    if not isinstance(token, str):        # a non-string (e.g. a nested token dict)
+        return None
     parts = token.split(".")
     if len(parts) != 3:
         return None

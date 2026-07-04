@@ -33,10 +33,12 @@ def _extract_token(body: dict) -> str | None:
     if not isinstance(body, dict):
         return None
     for f in _TOKEN_FIELDS:
-        if body.get(f):
-            return body[f]
-    # nested {"data": {...}} / {"tokens": {...}} / {"user": {...}} (RealWorld)
-    for wrap in ("data", "tokens", "result", "user"):
+        v = body.get(f)
+        if isinstance(v, str) and v:      # a STRING token, never a nested object
+            return v
+    # nested token envelopes: {"token": {"access_token": …}} (this is common),
+    # {"data": {...}} / {"tokens": {...}} / {"user": {...}} (RealWorld)
+    for wrap in ("token", "data", "tokens", "result", "user", "auth", "session"):
         inner = body.get(wrap)
         if isinstance(inner, dict):
             t = _extract_token(inner)
@@ -219,6 +221,12 @@ def bootstrap(profile: AppProfile, creds: list[Cred], *,
         atk = _register_attacker(http, profile)
         if atk:
             principals["attacker"] = atk
+            # A SECOND self-registered low-priv user (a "victim") so cross-principal
+            # BOLA can be tested WITHOUT DB --provision: attacker A tries to read/
+            # modify victim B's own objects. Only if it carries a distinct user id.
+            victim = _register_attacker(http, profile, label="attacker2", suffix="2")
+            if victim and victim.user_id and victim.user_id != atk.user_id:
+                principals["attacker2"] = victim
 
     profile.principals = principals
     return principals
@@ -279,10 +287,16 @@ def _synth_field(name: str, spec: dict, *, ident: str, username: str,
     return "heimdall"
 
 
-def _register_attacker(http: HttpClient, profile: AppProfile) -> Principal | None:
+def _register_attacker(http: HttpClient, profile: AppProfile, *,
+                       label: str = "attacker", suffix: str = "") -> Principal | None:
     ap = profile.auth
-    ident = "heimdall.attacker@example.com"
-    username = "heimdall_attacker"
+    # UNIQUE identity per run — a fixed email collides with a user left in a
+    # persistent DB by an earlier run (registration then fails, yielding no
+    # principal and silently degrading every authed check).
+    import uuid
+    tag = uuid.uuid4().hex[:8]
+    ident = f"heimdall.attacker{suffix}.{tag}@example.com"
+    username = f"heimdall_attacker{suffix}_{tag}"
     password = "Heimdall!Attacker#2026"
     fields = {f.lower(): f for f in ap.register_fields}
     schema = ap.register_schema or {}
@@ -324,7 +338,7 @@ def _register_attacker(http: HttpClient, profile: AppProfile) -> Principal | Non
         return None
     _calibrate_scheme(http, profile, tok)   # lock in the working header scheme
     http = _client(profile)
-    p = Principal(label="attacker", role="attacker", email=ident, username=username,
+    p = Principal(label=label, role="attacker", email=ident, username=username,
                   password=password, token=tok)
     p.user_id = _whoami(http, profile, tok)
     if not profile.auth.jwt_alg:

@@ -8,40 +8,81 @@ modules read routes off here rather than hard-coding paths.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import requests
 
 from ..core.model import Route, RouteMap
 
-# Common locations FastAPI/other frameworks expose the schema at.
+# Common locations FastAPI/other frameworks expose the schema at. Apps routinely
+# version the API (openapi_url="/v1/openapi.json"), so cover the version prefixes.
 OPENAPI_CANDIDATES = [
     "/openapi.json",
     "/api/openapi.json",
     "/api/v1/openapi.json",
+    "/api/v2/openapi.json",
+    "/v1/openapi.json",
+    "/v2/openapi.json",
+    "/v3/openapi.json",
     "/docs/openapi.json",
     "/swagger.json",
     "/v3/api-docs",  # springdoc, in case a proxy fronts something else
 ]
 
 DOC_CANDIDATES = ["/docs", "/redoc", "/swagger", "/api/docs"]
+# Docs pages we scrape as a last resort to learn a CUSTOM openapi_url — the
+# Swagger/ReDoc HTML references it (url: '…/openapi.json' / spec-url="…").
+_DOCS_TO_SCRAPE = ["/docs", "/v1/docs", "/v2/docs", "/api/docs", "/api/v1/docs",
+                   "/redoc", "/v1/redoc", "/swagger", "/swagger-ui"]
+_OPENAPI_HREF_RE = re.compile(r"""["']([^"'\s]*openapi[^"'\s]*\.json)["']""", re.IGNORECASE)
+
+
+def _try_spec(base: str, path: str, timeout: float) -> tuple[str, dict] | None:
+    try:
+        r = requests.get(f"{base}{path}", timeout=timeout)
+    except requests.RequestException:
+        return None
+    if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
+        try:
+            spec = r.json()
+        except ValueError:
+            return None
+        if isinstance(spec, dict) and ("openapi" in spec or "swagger" in spec):
+            return path, spec
+    return None
 
 
 def fetch_openapi(base_url: str, timeout: float = 15.0) -> tuple[str, dict] | None:
     """Return ``(path, spec)`` for the first reachable OpenAPI doc, else None."""
     base = base_url.rstrip("/")
     for path in OPENAPI_CANDIDATES:
+        hit = _try_spec(base, path, timeout)
+        if hit:
+            return hit
+    # Fallback: scrape a docs page for a custom openapi_url (e.g. "/v1/openapi.json"
+    # served under a versioned docs_url that our static list can't guess).
+    for dp in _DOCS_TO_SCRAPE:
         try:
-            r = requests.get(f"{base}{path}", timeout=timeout)
+            r = requests.get(f"{base}{dp}", timeout=timeout)
         except requests.RequestException:
             continue
-        if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
-            try:
-                spec = r.json()
-            except ValueError:
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", "").lower():
+            continue
+        seen: set = set()
+        for m in _OPENAPI_HREF_RE.finditer(r.text):
+            cand = m.group(1)
+            if cand.startswith("http"):
+                from urllib.parse import urlparse
+                cand = urlparse(cand).path
+            if not cand.startswith("/"):
+                cand = "/" + cand
+            if cand in seen:
                 continue
-            if isinstance(spec, dict) and ("openapi" in spec or "swagger" in spec):
-                return path, spec
+            seen.add(cand)
+            hit = _try_spec(base, cand, timeout)
+            if hit:
+                return hit
     return None
 
 
