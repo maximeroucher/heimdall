@@ -199,6 +199,24 @@ heimdall --url http://127.0.0.1:8000 --baseline known-findings.json --fail-on me
 only breaks on *new* ones. Upload `findings.sarif` with
 `github/codeql-action/upload-sarif` to surface results in the Security tab.
 
+## Try it — bundled vulnerable demo
+
+The repo ships a deliberately-insecure FastAPI app so you can see Heimdall work
+end-to-end without pointing it at anything of your own:
+
+```bash
+pip install -e '.[demo]'
+uvicorn examples.vulnerable_app.main:app --host 127.0.0.1 --port 8099
+heimdall --url http://127.0.0.1:8099 --source examples/vulnerable_app \
+         --cred admin:admin:admin:admin123 --cred alice:user:alice:alice123
+```
+
+A clean run reports **~1 CRITICAL + 7-8 HIGH** — JWT-secret forgery, BOLA/IDOR,
+BFLA, reflected XSS, SSRF, credentialed CORS, PII/secret exposure, and more —
+alongside TESTED-SAFE verdicts on the app's few correct endpoints. Every finding
+maps to a planted flaw documented in
+[`examples/vulnerable_app/README.md`](examples/vulnerable_app/README.md).
+
 ## Safety & scope
 
 - **Guardrail:** Heimdall refuses any non-loopback target unless you pass

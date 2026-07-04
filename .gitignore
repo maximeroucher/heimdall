@@ -22,4 +22,7 @@ heimdall.local.toml
 *.local.json
 .env
 
+# Runtime DB created by the vulnerable demo app.
+examples/vulnerable_app/*.sqlite
+
 .DS_Store
