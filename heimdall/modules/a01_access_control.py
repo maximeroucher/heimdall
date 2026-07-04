@@ -22,9 +22,20 @@ _ADMIN_HINT = ("admin", "superuser", "super-admin", "internal", "manage", "/all"
 # are legitimately public and would create noise.
 _PUBLIC_OK = ("login", "register", "token", "openapi", "docs", "health",
               "reset", "forgot", "signup", "authorize", "/redoc")
+# Framework/utility endpoints that are public by design across apps. Matched
+# EXACTLY (not as substrings) so "/test" doesn't swallow "/latest" and "/" doesn't
+# match everything. An app that declares a global security scheme makes every
+# route look auth-required; these must be excluded from "reachable unauthenticated".
+_PUBLIC_EXACT = frozenset({
+    "/", "/routes", "/test", "/ping", "/pong", "/healthz", "/livez", "/readyz",
+    "/health/liveliness", "/health/readiness", "/metrics", "/version", "/status",
+    "/favicon.ico", "/robots.txt", "/openapi.json", "/docs", "/redoc", "/",
+})
 
 
 def _is_public_by_design(path: str, oid: str) -> bool:
+    if path in _PUBLIC_EXACT:
+        return True
     blob = f"{path} {oid}".lower()
     return any(h in blob for h in _PUBLIC_OK)
 

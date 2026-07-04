@@ -234,12 +234,23 @@ def _entropy_secret(sval: str) -> bool:
     return _shannon(sval) >= 3.5
 
 
+# Schema/UI-metadata fields hold ILLUSTRATIVE values (a form placeholder like
+# "sk-..." or an example card "4111 1111 1111 1111"), not real data — so their
+# values must not be judged as leaked secrets by format/entropy.
+_META_FIELDS = frozenset({
+    "placeholder", "example", "examples", "sample", "hint", "default", "pattern",
+    "format", "mask", "template", "demo", "eg", "e_g", "prefix_example",
+})
+
+
 def _sensitive(key: str, value, auth_route: bool, known_pw: set):
     """Return (reason, severity) or None. Value format/checksum matches are
     HIGH-confidence; entropy and name-based matches are MEDIUM."""
     if value is None or value == "" or value is True or value is False:
         return None
     kl = key.lower()
+    if kl in _META_FIELDS:            # illustrative example, not a real value
+        return None
     sval = str(value)
     # 1) the VALUE itself is sensitive by format/checksum — behavioural, name-blind
     #    (credentials, provider keys, card numbers, IBANs, SSNs). HIGH confidence.

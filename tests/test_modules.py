@@ -15,6 +15,29 @@ def test_all_modules_register():
     assert REGISTRY["a01"].destructive is False
 
 
+def test_a01_framework_utility_paths_are_public():
+    """Root/routes/test/metrics etc. are public utility endpoints — an app with a
+    global security scheme must not have them flagged as auth-required-reachable."""
+    assert a01._is_public_by_design("/", "root")
+    assert a01._is_public_by_design("/routes", "get_routes")
+    assert a01._is_public_by_design("/test", "test_endpoint")
+    assert a01._is_public_by_design("/metrics", "metrics")
+    # exact match only — no substring false friends, still catches real routes
+    assert not a01._is_public_by_design("/latest", "get_latest")
+    assert not a01._is_public_by_design("/users/{id}", "get_user_by_id")
+
+
+def test_data_exposure_skips_schema_metadata_fields():
+    """A placeholder/example value that LOOKS like a key is illustrative, not a
+    leak; the same value under a real field name is flagged."""
+    from heimdall.modules import data_exposure as de
+
+    secretish = "Xk9mQ2wL8pR4tY7nZ3vB"
+    assert de._sensitive("placeholder", secretish, False, set()) is None
+    assert de._sensitive("example", secretish, False, set()) is None
+    assert de._sensitive("api_key", secretish, False, set()) is not None
+
+
 def test_looks_like_id_param():
     assert looks_like_id_param("user_id")
     assert looks_like_id_param("id")
