@@ -616,6 +616,45 @@ def test_sast_sql_fstring_trusted_interpolation(tmp_path):
     assert "WHERE n" in sqli[0]
 
 
+def test_sast_auth_edge_cases_security_alias_appdeps_concat(tmp_path):
+    """More adversarial auth: Security() inside an Annotated alias, a global
+    FastAPI(dependencies=[auth]), and a concatenated deps list — all authed; the
+    non-auth equivalents still flag."""
+    from heimdall.modules import sast
+
+    # Security() in an Annotated alias
+    a = tmp_path / "a"
+    a.mkdir()
+    (a / "m.py").write_text(
+        "from typing import Annotated\n"
+        "from fastapi import FastAPI, Security\n"
+        "Admin = Annotated[object, Security(oauth2)]\n"
+        "app = FastAPI()\n"
+        "@app.post('/x')\n"
+        "def h(u: Admin): ...\n")
+    assert "noauth" not in _sast_full_scan(sast, a)[0]
+
+    # global FastAPI(dependencies=[auth]) + concatenated auth deps var
+    b = tmp_path / "b"
+    b.mkdir()
+    (b / "m.py").write_text(
+        "from fastapi import FastAPI, Depends\n"
+        "app = FastAPI(dependencies=[Depends(get_current_user)])\n"
+        "@app.post('/x')\n"
+        "def h(body): ...\n")
+    assert "noauth" not in _sast_full_scan(sast, b)[0]
+
+    # control: FastAPI(dependencies=[non-auth]) still flags
+    c = tmp_path / "c"
+    c.mkdir()
+    (c / "m.py").write_text(
+        "from fastapi import FastAPI, Depends\n"
+        "app = FastAPI(dependencies=[Depends(get_db)])\n"
+        "@app.post('/x')\n"
+        "def h(body): ...\n")
+    assert any("/x" in code for _, code in _sast_full_scan(sast, c)[0].get("noauth", []))
+
+
 def test_sast_auth_edge_cases_partial_realias_depsvar(tmp_path):
     """Adversarial auth patterns: partial(auth_fn), an alias-of-an-alias, and a
     dependencies=<variable> list — all authenticated; a non-auth deps variable

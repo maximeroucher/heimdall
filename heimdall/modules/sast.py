@@ -283,8 +283,7 @@ def _collect_auth_aliases(tree: ast.AST, aliases: set) -> None:
         if not (isinstance(base, ast.Name) and base.id == "Annotated"):
             continue
         for sub in ast.walk(val):
-            if (isinstance(sub, ast.Call) and _callee(sub).split(".")[-1] == "Depends"
-                    and sub.args and _depends_is_auth(sub)):
+            if _is_auth_dep_call(sub):        # Depends(auth) OR Security(...)
                 for t in targets:
                     if isinstance(t, ast.Name):
                         aliases.add(t.id)
@@ -407,7 +406,9 @@ def _resolve_protected_routers(parsed: list, top_pkg: str) -> set:
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
                 callee_tail = _callee(node.value).split(".")[-1]
-                if ((callee_tail == "APIRouter"
+                # `APIRouter(dependencies=[Depends(auth)])` or a global
+                # `FastAPI(dependencies=[Depends(auth)])` (app-wide auth)
+                if ((callee_tail in ("APIRouter", "FastAPI")
                      and _deps_list_has_auth(_kwarg(node.value, "dependencies")))
                         or callee_tail in auth_router_classes):
                     for t in node.targets:
@@ -581,10 +582,11 @@ def _decorator_deps_auth(dec: ast.AST, auth_deps_vars: set | frozenset = frozens
     deps = next((k.value for k in dec.keywords if k.arg == "dependencies"), None)
     if deps is None:
         return False
-    # `dependencies=deps` where `deps = [Depends(auth)]` (a variable, not a literal)
-    if isinstance(deps, ast.Name) and deps.id in auth_deps_vars:
-        return True
+    # `dependencies=deps` or `dependencies=base + [...]` where a variable holds an
+    # auth dep list (a Name anywhere in the expression that's a known auth-dep var)
     for sub in ast.walk(deps):
+        if isinstance(sub, ast.Name) and sub.id in auth_deps_vars:
+            return True
         if _is_auth_dep_call(sub):
             return True
     return False
