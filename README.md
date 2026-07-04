@@ -95,11 +95,17 @@ checks across *many* distinct owners), let Heimdall build the world:
 
 ```bash
 # Boot the app onto a throwaway DB, seed real principals, then attack — all disposable:
-heimdall --url http://127.0.0.1:8000 \
-         --launch 'uvicorn app.main:app --port 8000' --launch-cwd /path/to/App \
+heimdall --url http://127.0.0.1:8100 --source /path/to/App \
+         --launch '/path/to/App/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100' \
+         --launch-cwd /path/to/App \
          --spawn-db \
-         --provision 3 --provision-admins 1
+         --provision 3 --provision-admins 1 \
+         --launch-timeout 300
 ```
+
+Point `--launch` at the target's *own* interpreter (e.g. its `.venv/bin/uvicorn`)
+so the boot command resolves the app's dependencies, and give `--launch-timeout`
+enough room for an app that migrates/seeds on first boot.
 
 `--provision` inserts distinct users (hashing passwords the way the app's own
 model expects) and logs each in through the real login flow, giving the `a01`
@@ -107,21 +113,9 @@ BOLA/IDOR/BFLA probes genuine cross-user subjects. Combined with `--spawn-db` /
 `--launch`, a whole assessment — server, database, users — is created and torn
 down around a single command.
 
-For a **heavier app** that runs migrations and seeds fixtures on boot (and has a
-built-in SQLite mode), force the dependency-free SQLite throwaway and give the
-boot more time — nothing else changes:
-
-```bash
-heimdall --url http://127.0.0.1:8100 --name App --source /path/to/App \
-         --launch '.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100' \
-         --launch-cwd /path/to/App \
-         --spawn-db --spawn-db-kind sqlite \
-         --provision 3 --provision-admins 1 \
-         --launch-timeout 300
-```
-
-Point `--launch` at the target's *own* interpreter (e.g. its `.venv/bin/uvicorn`)
-so the boot command resolves the app's dependencies.
+If the app has a built-in **SQLite mode**, add `--spawn-db-kind sqlite` — the
+dependency-free throwaway (no Docker, no port wiring). Otherwise `--spawn-db`
+auto-detects the engine.
 
 Prefer a **server engine** (the app's real backend)? Use `--spawn-db-kind postgres`
 (or `mysql`) instead — Heimdall spins a throwaway Docker server, reads the DB
