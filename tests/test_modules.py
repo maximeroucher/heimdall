@@ -38,6 +38,37 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_open_redirect_matches_effective_nav_host_not_substring():
+    """The canary must be the browser's effective navigation host (or a subdomain
+    of it) — not merely a substring of the Location. Kills the classic FPs:
+    userinfo @, canary-in-path, and a lookalike domain that contains the canary."""
+    from heimdall.modules import open_redirect as orr
+
+    C = orr._CANARY_HOST
+
+    class Resp:
+        def __init__(self, status, location="", body=""):
+            self.status_code = status
+            self.headers = {"Location": location} if location else {}
+            self.text = body
+
+    hit = lambda r: orr._redirects_to(r, C) is not None
+    # genuine open redirects (the payload forms we send) must flag
+    assert hit(Resp(302, location=f"https://{C}/"))
+    assert hit(Resp(302, location=f"//{C}/"))
+    assert hit(Resp(302, location=f"https:{C}"))
+    assert hit(Resp(302, location=f"https://trusted.example.{C}/"))   # subdomain of canary
+    assert hit(Resp(302, location=f"/\\{C}/"))                        # backslash bypass
+    assert hit(Resp(200, body=f"<script>window.location='https://{C}/x'</script>"))
+    # safe redirects that merely mention the canary must stay quiet
+    assert not hit(Resp(302, location=f"https://{C}@legit.example.com/"))     # userinfo
+    assert not hit(Resp(302, location=f"https://legit.example.com/go/https://{C}/"))  # in path
+    assert not hit(Resp(302, location="https://evil-heimdall-redir.test.attacker-really.com/"))
+    assert not hit(Resp(302, location=f"/{C}"))                        # path-absolute
+    assert not hit(Resp(200, location=f"https://{C}/"))                # not a 3xx
+    assert not hit(Resp(200, body=f"<p>never visit {C}</p>"))          # mention, no redirect
+
+
 def test_data_exposure_iban_spaces_and_base64_magic():
     """Space-formatted IBANs are caught (checksum-validated on a stripped copy);
     base64 file/image data (magic prefix) is not a secret."""

@@ -19,6 +19,8 @@ classic filter bypasses (scheme-relative ``//host``, ``https:host``, and a
 
 from __future__ import annotations
 
+import re
+
 import requests
 
 from ..core.context import Context
@@ -105,10 +107,9 @@ def _redirects_to(resp, host: str) -> str | None:
     if resp is None:
         return None
     loc = resp.headers.get("Location", "")
-    if _host_of(loc) == host or host in loc.split("?", 1)[0]:
-        if 300 <= resp.status_code < 400:
-            return f"HTTP {resp.status_code} Location: {loc[:200]}"
-    # Body-level redirect (meta refresh / JS) that names the canary host.
+    if 300 <= resp.status_code < 400 and _nav_host_is(loc, host):
+        return f"HTTP {resp.status_code} Location: {loc[:200]}"
+    # Body-level redirect (meta refresh / JS) that navigates to the canary host.
     try:
         body = resp.text or ""
     except Exception:  # pragma: no cover - defensive
@@ -116,19 +117,54 @@ def _redirects_to(resp, host: str) -> str | None:
     low = body.lower()
     if host in low and ("http-equiv=\"refresh\"" in low or "window.location" in low
                         or "location.href" in low or "location.replace" in low):
-        i = low.find(host)
-        return f"client-side redirect in body: …{body[max(0, i - 50):i + 30]}…"
+        # Confirm a URL in the body actually *navigates* to the canary host
+        # (not merely mentions it in a path/querystring of a same-origin URL).
+        for cand in _URL_IN_BODY.findall(body):
+            if _nav_host_is(cand, host):
+                i = low.find(host)
+                return f"client-side redirect in body: …{body[max(0, i - 50):i + 30]}…"
     return None
 
 
-def _host_of(url: str) -> str:
-    """Best-effort host extraction covering scheme-relative //host forms."""
-    u = url.strip()
-    for pref in ("https://", "http://", "//"):
-        if u.lower().startswith(pref):
-            rest = u[len(pref):]
-            return rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-    return ""
+# URL-ish tokens in a body (absolute, scheme-relative, or opaque scheme:host).
+_URL_IN_BODY = re.compile(r"""(?:[a-zA-Z][a-zA-Z0-9+.\-]*:)?//[^\s"'<>()]+"""
+                          r"""|https?:[^\s"'<>()/]+""")
+
+
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
+
+
+def _nav_host(url: str) -> str:
+    """The host a browser actually navigates to for this Location value.
+
+    Mirrors browser authority parsing so we match on the *effective* host, not a
+    naive substring: backslashes normalise to slashes; a leading ``scheme:`` is
+    stripped; ``//authority`` (or the opaque ``https:host`` form) yields a host;
+    a path-relative or path-absolute value has no external host. Userinfo
+    (``user@host``) and port are stripped so ``https://canary@real.host/`` reads
+    as ``real.host`` (goes to real.host — NOT an open redirect to the canary),
+    and ``/goto/https://canary/`` reads as the app's own host (canary is only in
+    the path). This is what kills the classic open-redirect false positives."""
+    u = url.strip().replace("\\", "/")
+    m = _SCHEME_RE.match(u)
+    had_scheme = bool(m)
+    if m:
+        u = u[m.end():]
+    if u.startswith("//"):
+        u = u[2:]
+    elif u.startswith("/") or not had_scheme:
+        return ""                    # path (relative/absolute) → same origin
+    # else: opaque "scheme:host" form → the remainder starts with the host
+    authority = u.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    host = authority.split("@")[-1].split(":", 1)[0]     # drop userinfo + port
+    return host.lower()
+
+
+def _nav_host_is(loc: str, canary: str) -> bool:
+    """True if the browser would navigate to the canary host or a subdomain of
+    it (a subdomain of the attacker-controlled canary domain is still theirs)."""
+    h = _nav_host(loc)
+    return bool(h) and (h == canary or h.endswith("." + canary))
 
 
 def _probe(ctx: Context, route, name: str, location: str, token: str | None):
