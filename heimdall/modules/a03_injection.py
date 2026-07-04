@@ -87,6 +87,7 @@ _NOSQL_KEYS = ("username", "email", "user", "name", "id", "login", "q", "query",
 def run(ctx: Context) -> None:
     _sqli_sweep(ctx)
     _xss_probe(ctx)
+    _xss_get_probe(ctx)
     _operator_injection(ctx)
     _ssti_probe(ctx)
     _path_traversal_probe(ctx)
@@ -254,6 +255,14 @@ def _sqli_sweep(ctx: Context) -> None:
         )
 
 
+def _raw_html_reflection(resp, payload: str) -> bool:
+    """True when the exact payload is echoed un-encoded in an HTML response — the
+    reflected-XSS signal. A JSON echo (no ``text/html``) or an HTML-encoded echo
+    (``&lt;script&gt;``) does not match, which removes those false-positive classes."""
+    ctype = resp.headers.get("Content-Type", "").lower()
+    return payload in (resp.text or "") and "html" in ctype
+
+
 def _xss_probe(ctx: Context) -> None:
     """Send a unique <script> marker into string body fields; flag raw reflection."""
     if ctx.safe:
@@ -287,8 +296,7 @@ def _xss_probe(ctx: Context) -> None:
         # A JSON API echoing the value back (the created object) is normal and
         # not XSS, so gating on Content-Type: text/html removes that whole class
         # of false positives; an HTML-encoded (&lt;script&gt;) echo also won't match.
-        ctype = resp.headers.get("Content-Type", "").lower()
-        if payload in resp.text and "html" in ctype:
+        if _raw_html_reflection(resp, payload):
             reflected.append((r, payload, resp))
 
     if reflected:
@@ -325,6 +333,73 @@ def _xss_probe(ctx: Context) -> None:
             summary=(
                 f"Submitted a <script> marker to {len(targets)} JSON-body write route(s); "
                 "none reflected the payload un-encoded in the response body."
+            ),
+        )
+
+
+def _xss_get_probe(ctx: Context) -> None:
+    """Reflected XSS via GET query params — the classic case the write-route probe
+    misses. Send a unique ``<script>`` marker into each string query param and flag
+    it only when it comes back RAW (un-encoded) in an ``text/html`` response.
+
+    Read-only (a GET), so it runs even under --safe. Gating on Content-Type html +
+    exact raw reflection keeps it high-signal: a JSON echo or an ``&lt;script&gt;``
+    encoded echo does not match.
+    """
+    token = _actor_token(ctx)
+    targets = [r for r in ctx.routes.by_method("GET") if r.query_params][:_XSS_ROUTE_CAP]
+    if not targets:
+        return
+    reflected = []
+    for n, r in enumerate(targets):
+        payload = f"<script>heimdallx{n}</script>"
+        for param in r.query_params[:_SQLI_PARAM_CAP]:
+            pname = param.get("name")
+            if not pname:
+                continue
+            try:
+                resp = ctx.get(r.fill_path({}), token=token, params={pname: payload})
+            except Exception as exc:
+                ctx.note(f"XSS GET probe failed for GET {r.path}?{pname}: {exc}")
+                continue
+            if _raw_html_reflection(resp, payload):
+                reflected.append((r, pname, payload, resp))
+                break
+
+    if reflected:
+        sample = "\n".join(
+            f"  GET {r.path}?{pname}={payload!r} -> {resp.status_code} (reflected raw, {resp.headers.get('Content-Type','')})"
+            for r, pname, payload, resp in reflected[:15]
+        )
+        r0, p0, pay0, _ = reflected[0]
+        ctx.finding(
+            id="a03-xss-reflected-get",
+            owasp="A03", severity="HIGH",
+            title=f"Reflected XSS via query param on {len(reflected)} route(s)",
+            summary=(
+                "A unique <script> marker placed in a GET query parameter was echoed back "
+                "verbatim — un-encoded — in an HTML response. A browser loading this URL "
+                "executes the script, so this is directly exploitable reflected XSS. Apply "
+                "context-aware output encoding (HTML-escape on render) and a Content-Security-Policy."
+            ),
+            evidence=sample,
+            route=f"GET {r0.path}",
+            request=f"GET {r0.fill_path({})}?{p0}={pay0}",
+            reproduction=(
+                f"curl -s '{ctx.base_url}{r0.fill_path({})}?{p0}=<script>alert(1)</script>'"
+                "  # observe the raw <script> in an HTML response"
+            ),
+            references=[REFS["A03"]],
+            tools=["Burp Suite (Intruder)", "XSS Hunter", "curl"],
+        )
+    else:
+        ctx.finding(
+            id="a03-xss-reflected-get",
+            owasp="A03", severity="SAFE",
+            title="No reflected XSS via query parameters",
+            summary=(
+                f"Placed a <script> marker in the query params of {len(targets)} GET route(s); "
+                "none reflected it un-encoded in an HTML response."
             ),
         )
 

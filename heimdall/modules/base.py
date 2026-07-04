@@ -56,4 +56,10 @@ def body_says_error(text: str) -> bool:
         "traceback (most recent call last)", "sqlalchemy", "psycopg",
         "syntax error at or near", "unterminated quoted string",
         "integrityerror", "programmingerror", "operationalerror",
+        # SQLite (stdlib sqlite3 / aiosqlite) — extremely common, its raw errors
+        # read differently from Postgres/MySQL and were slipping through.
+        "unrecognized token", "sqlite3.", "no such column", "no such table",
+        "sqlite_error", "malformed database", "incomplete input",
+        # MySQL / MariaDB driver errors.
+        "you have an error in your sql syntax", "warning: mysqli", "mysqlnd",
     ))

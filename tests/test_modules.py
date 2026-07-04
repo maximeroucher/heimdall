@@ -167,6 +167,48 @@ def test_a03_boolean_sqli_needs_reproducible_stable_divergence():
     assert _confirmed_boolean_sqli(lambda p: R(200, "n" * (100 + next(c) * 137 % 900)), T, F) is None
 
 
+def test_body_says_error_recognizes_sqlite_and_mysql_errors():
+    """SQLite (stdlib sqlite3) is one of the most common backends, but its raw
+    errors ('unrecognized token', 'no such column') read nothing like Postgres,
+    so an error-based injection into a SQLite app was slipping through as SAFE.
+    MySQL driver errors are covered too. Benign text must not match."""
+    from heimdall.modules.base import body_says_error
+
+    # SQLite
+    assert body_says_error('{"error":"unrecognized token: \\"\'\\""}')
+    assert body_says_error("sqlite3.OperationalError: no such column: x")
+    assert body_says_error("no such table: users")
+    # Postgres / SQLAlchemy (pre-existing)
+    assert body_says_error("psycopg2.errors.SyntaxError: syntax error at or near")
+    # MySQL
+    assert body_says_error("You have an error in your SQL syntax; check the manual")
+    # benign responses stay quiet
+    assert not body_says_error('{"results": [], "count": 0}')
+    assert not body_says_error("Hello, world")
+
+
+def test_a03_reflected_xss_via_get_flags_html_not_json():
+    """The classic reflected XSS — a <script> in a GET query param echoed raw into
+    an HTML page — must flag; a JSON API echoing the value back (the normal case)
+    and an HTML-encoded echo must not."""
+    from heimdall.modules.a03_injection import _raw_html_reflection
+
+    P = "<script>heimdallx0</script>"
+
+    class Resp:
+        def __init__(self, ctype, body):
+            self.headers = {"Content-Type": ctype}
+            self.text = body
+
+    # raw reflection in an HTML response → XSS
+    assert _raw_html_reflection(Resp("text/html; charset=utf-8", f"<h1>Hello {P}</h1>"), P)
+    # same payload echoed by a JSON API → not XSS (browser won't render it)
+    assert not _raw_html_reflection(Resp("application/json", f'{{"name":"{P}"}}'), P)
+    # HTML response but the payload was encoded on output → safe
+    assert not _raw_html_reflection(
+        Resp("text/html", "<h1>Hello &lt;script&gt;heimdallx0&lt;/script&gt;</h1>"), P)
+
+
 def test_host_header_body_reflection_requires_url_context():
     """A poisoned Host reflected into a body URL (reset link) flags; a debug /
     header-echo endpoint that merely mirrors the request header value as JSON or
