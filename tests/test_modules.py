@@ -222,6 +222,37 @@ def test_open_redirect_matches_effective_nav_host_not_substring():
     assert not hit(Resp(200, body=f"<p>never visit {C}</p>"))          # mention, no redirect
 
 
+def test_data_exposure_public_metadata_kid_not_a_leak(tmp_path):
+    """A high-entropy `kid` (public Key ID) on JWKS / OpenID-discovery is public
+    by design, not a data leak; but a PRIVATE JWK component (d/p/q) published in a
+    key set IS still flagged."""
+    from types import SimpleNamespace
+    from heimdall.modules import data_exposure as de
+
+    r = lambda p: SimpleNamespace(path=p, operation_id="")
+    assert de._is_public_metadata(r("/.well-known/jwks.json"))
+    assert de._is_public_metadata(r("/.well-known/openid-configuration"))
+    assert de._is_public_metadata(r("/tenant/jwks"))
+    assert not de._is_public_metadata(r("/api/users"))
+    # a public key id is high-entropy but must NOT be treated as a secret...
+    assert de._entropy_secret("xnsr1uKqZ8pL3mW9tB7vC2yD4fH6gJ0")  # (it IS high-entropy)
+    # ...while private JWK members remain in the flag set for the metadata guard
+    for priv in ("d", "p", "q", "dp", "dq", "qi", "k"):
+        assert priv in de._JWK_PRIVATE_FIELDS
+
+
+def test_a07_oauth_token_endpoint_is_not_a_password_login():
+    """OAuth token-endpoint protocol errors mean 'not a password login' (skip the
+    rate-limit finding); invalid_grant is EXCLUDED because it is the genuine
+    wrong-credentials error for a password grant."""
+    from heimdall.modules.a07_auth import _OAUTH_NONLOGIN_ERRORS
+
+    assert "invalid_client" in _OAUTH_NONLOGIN_ERRORS
+    assert "unsupported_grant_type" in _OAUTH_NONLOGIN_ERRORS
+    assert "invalid_request" in _OAUTH_NONLOGIN_ERRORS
+    assert "invalid_grant" not in _OAUTH_NONLOGIN_ERRORS   # that IS a real login rejection
+
+
 def test_sast_skips_developer_tooling_dirs(tmp_path):
     """SAST must not scan developer tooling (dev/, scripts/, code-generation, …):
     their requests.get / os.system run at dev time, never from an HTTP handler, so

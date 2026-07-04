@@ -130,6 +130,21 @@ def _is_auth_route(route) -> bool:
     return any(h in hay for h in _AUTH_HINTS)
 
 
+# Standard PUBLIC protocol-metadata endpoints: their content (public keys, config
+# URLs, supported algorithms) is meant to be world-readable, so high-entropy
+# values there — a key id, an RSA modulus — are not data leaks.
+_PUBLIC_METADATA_RE = re.compile(
+    r"(?:^|/)\.well-known/|/jwks(?:\.json)?(?:$|/|\?)|openid-configuration|"
+    r"oauth-authorization-server", re.I)
+# PRIVATE JWK members — these must never appear in a PUBLISHED key set; if one
+# does, it IS a critical leak and stays flagged even on a metadata endpoint.
+_JWK_PRIVATE_FIELDS = frozenset({"d", "p", "q", "dp", "dq", "qi", "k"})
+
+
+def _is_public_metadata(route) -> bool:
+    return bool(_PUBLIC_METADATA_RE.search(route.path))
+
+
 # Claims that identify WHO a token belongs to. `sub` is included only when it
 # isn't one of these generic token-TYPE markers (RealWorld sets sub="access").
 _IDENTITY_CLAIMS = ("username", "preferred_username", "email", "user_id",
@@ -178,7 +193,14 @@ def _inspect(ctx: Context, route, token, hits: list[dict], known_pw: set) -> Non
     except Exception:  # noqa: BLE001
         return
     auth_route = _is_auth_route(route)
+    public_meta = _is_public_metadata(route)
     for keypath, key, value in _walk(data):
+        # A public protocol-metadata endpoint (JWKS, OpenID discovery) publishes
+        # PUBLIC keys/config by design — a high-entropy `kid`, modulus `n`, or a
+        # config URL there is not a leak. Still flag a PRIVATE-key JWK component
+        # (`d`/`p`/`q`/…) — those must NEVER appear in a published JWKS.
+        if public_meta and key.lower() not in _JWK_PRIVATE_FIELDS:
+            continue
         res = _sensitive(key, value, auth_route, known_pw)
         if res:
             if _is_own_token(value, token):

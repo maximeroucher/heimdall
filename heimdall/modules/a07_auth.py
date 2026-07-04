@@ -83,6 +83,12 @@ def run(ctx: Context) -> None:
 # FastAPI defence). Recognising only 429 misses lockout-based apps entirely.
 _THROTTLE_CODES = frozenset({429, 423})
 
+# OAuth2 token-endpoint error codes that mean the request never became a USER
+# password login (client-auth / grant / request errors). `invalid_grant` is NOT
+# here — it is the genuine wrong-credentials error for a password grant.
+_OAUTH_NONLOGIN_ERRORS = ("invalid_client", "unsupported_grant_type",
+                          "invalid_request", "unauthorized_client")
+
 
 def _brute_force(ctx: Context) -> None:
     """~12 rapid bogus logins should trip a throttle/lockout; if one does, test
@@ -96,12 +102,18 @@ def _brute_force(ctx: Context) -> None:
     ident = (princ.email if princ and getattr(princ, "email", None)
              else f"heimdall.bruteforce+{_next_suffix(ctx)}@example.com")
     codes: list[int] = []
+    sample_body = ""
     tripped_at = None
     trip_code = None
     try:
         for i in range(12):
             resp = _login_attempt(ctx, ident, f"wrong-pw-{i}")
             codes.append(resp.status_code)
+            if not sample_body:
+                try:
+                    sample_body = (resp.text or "")[:400].lower()
+                except Exception:  # noqa: BLE001
+                    sample_body = ""
             if resp.status_code in _THROTTLE_CODES:
                 tripped_at = i + 1
                 trip_code = resp.status_code
@@ -122,6 +134,17 @@ def _brute_force(ctx: Context) -> None:
             ctx.note(f"login probe at {ctx.auth.login_path} returned "
                      f"{sorted(set(codes))} — no credential evaluation (not a usable "
                      "login endpoint); brute-force/rate-limit check skipped")
+            return
+        # An OAuth2 TOKEN endpoint (authorization_code/client_credentials) mistaken
+        # for a username/password login answers 400 with a protocol error
+        # (invalid_client / unsupported_grant_type / invalid_request) — CLIENT auth,
+        # not USER-credential evaluation. `invalid_grant` is deliberately excluded:
+        # that IS the wrong-credentials error for a password grant. Treat the former
+        # as "not a password login" and skip, else it's a false 'no rate limit'.
+        if all(c == 400 for c in codes) and any(m in sample_body for m in _OAUTH_NONLOGIN_ERRORS):
+            ctx.note(f"login probe at {ctx.auth.login_path} returned OAuth protocol errors "
+                     f"(400 {[m for m in _OAUTH_NONLOGIN_ERRORS if m in sample_body]}) — an "
+                     "OAuth2 token endpoint, not a password login; rate-limit check skipped")
             return
         ctx.finding(
             id="a07-login-rate-limit",
