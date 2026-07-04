@@ -118,12 +118,18 @@ def _canary_in(resp) -> str | None:
     for h, v in resp.headers.items():
         if _CANARY in str(v):
             return f"header {h}: {str(v)[:160]}"
+    # In the BODY, require the canary to appear as a URL host (immediately after
+    # `//`, i.e. `https://canary` or scheme-relative `//canary`) — a plain
+    # header-echo/debug endpoint that mirrors the request `X-Forwarded-Host` value
+    # back as JSON/text is not URL construction and must not be flagged.
     try:
-        if _CANARY in (resp.text or ""):
-            i = resp.text.find(_CANARY)
-            return f"body: …{resp.text[max(0, i - 40):i + 40]}…"
+        body = resp.text or ""
     except Exception:  # pragma: no cover - defensive
-        pass
+        body = ""
+    j = body.lower().find("//" + _CANARY)
+    if j != -1:
+        i = j + 2
+        return f"body: …{body[max(0, i - 40):i + 40]}…"
     return None
 
 

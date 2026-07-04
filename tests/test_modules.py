@@ -38,6 +38,31 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_host_header_body_reflection_requires_url_context():
+    """A poisoned Host reflected into a body URL (reset link) flags; a debug /
+    header-echo endpoint that merely mirrors the request header value as JSON or
+    prose is not URL construction and must stay quiet. Location and response
+    headers (inherently URL-bearing) still match on substring."""
+    from heimdall.modules import host_header as hh
+
+    C = hh._CANARY
+
+    class Resp:
+        def __init__(self, status=200, headers=None, body=""):
+            self.status_code = status
+            self.headers = headers or {}
+            self.text = body
+
+    hit = lambda r: hh._canary_in(r) is not None
+    assert hit(Resp(302, headers={"Location": f"https://{C}/reset?token=abc"}))
+    assert hit(Resp(200, body=f'<a href="https://{C}/reset?token=abc">x</a>'))
+    assert hit(Resp(200, body=f'window.location="//{C}/verify"'))
+    assert hit(Resp(200, headers={"Link": f"<https://{C}/x>; rel=canonical"}))
+    # header-echo / prose mention: reflected but not a URL → quiet
+    assert not hit(Resp(200, body='{"headers":{"x-forwarded-host":"' + C + '"}}'))
+    assert not hit(Resp(200, body=f"Received request for host {C} (logged)"))
+
+
 def test_open_redirect_matches_effective_nav_host_not_substring():
     """The canary must be the browser's effective navigation host (or a subdomain
     of it) — not merely a substring of the Location. Kills the classic FPs:
