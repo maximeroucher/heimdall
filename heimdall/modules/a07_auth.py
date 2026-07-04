@@ -73,6 +73,7 @@ def run(ctx: Context) -> None:
         return
     _brute_force(ctx)
     _account_enum(ctx)
+    _register_enum(ctx)
     _mass_assignment(ctx)
     _weak_password(ctx)
 
@@ -281,6 +282,85 @@ def _forgot_password_enum(ctx: Context, known: str, absent: str) -> None:
             reproduction=f"POST {route.path} with a real vs. a fake email and diff the responses.",
             references=[REFS["A07"]],
             tools=["Burp (Comparer)", "curl"],
+        )
+
+
+_EXISTS_WORDS = ("already exist", "already registered", "already taken", "already in use",
+                 "duplicate", "is taken", " in use", "email exists", "user exists",
+                 "account exists")
+
+
+def _register_enum(ctx: Context) -> None:
+    """Registration should not reveal which emails already have an account.
+
+    Register a KNOWN-existing email (the attacker's own, created at bootstrap)
+    and a fresh one; if the endpoint answers differently — distinct status, or an
+    explicit 'already exists' only for the known one — it is an enumeration oracle.
+    """
+    a = ctx.auth
+    if not a.register_path:
+        ctx.note("no register path discovered; registration-enumeration check skipped")
+        return
+
+    def _reg(email: str):
+        # register content-type can differ from login's (e.g. form login + JSON
+        # signup, as in the official template) — try JSON, fall back to form.
+        body: dict = {a.username_field: email, "email": email, a.password_field: "Heimdall123!Aa"}
+        for f in a.register_fields:
+            body.setdefault(f, email if ("mail" in f.lower() or "name" in f.lower()) else "heimdall")
+        payload = {a.register_wrapper: body} if a.register_wrapper else body
+        r = ctx.post(a.register_path, json=payload)
+        if r.status_code in (415, 422):
+            r = ctx.post(a.register_path, data=body)
+        return r
+
+    # Self-contained + collision-proof: register a UNIQUE email (uuid, so it can't
+    # clash with users left in a persistent DB by an earlier run), then register
+    # THE SAME email again (now definitely existing) and compare to a brand-new
+    # one. Deterministic/counter emails would false-SAFE against a persistent DB.
+    import uuid
+    known = f"heimdall.known+{uuid.uuid4().hex[:12]}@example.com"
+    fresh = f"heimdall.fresh+{uuid.uuid4().hex[:12]}@example.com"
+    try:
+        _reg(known)                          # create it (first time)
+        rk = _reg(known)                     # register the SAME email again
+        rf = _reg(fresh)                      # register a genuinely new email
+    except Exception as e:  # noqa: BLE001
+        ctx.note(f"registration-enumeration probe errored: {e}")
+        return
+
+    kc, fc = rk.status_code, rf.status_code
+    kb, fb = (rk.text or "").lower(), (rf.text or "").lower()
+    known_reveals = any(w in kb for w in _EXISTS_WORDS)
+    fresh_reveals = any(w in fb for w in _EXISTS_WORDS)
+    # Oracle iff the pre-existing email is distinguishable from a fresh one. If
+    # both attempts returned the same status and neither names existence (e.g. an
+    # app that always 200s, or both 422 on a schema mismatch), there's no oracle.
+    enumerable = (kc != fc) or (known_reveals and not fresh_reveals)
+
+    if enumerable:
+        ctx.finding(
+            id="a07-register-user-enum", owasp="A07", severity="LOW",
+            title="Account enumeration via registration response",
+            summary=(
+                f"POST {a.register_path} answers differently when an email is already "
+                "registered vs. new (distinct status or an explicit 'already exists' "
+                "message), so an attacker can enumerate valid accounts before password "
+                "spraying. Return a generic success and email the address a 'you already "
+                "have an account' notice instead of revealing existence in the response."
+            ),
+            evidence=f"existing {known!r} -> {kc} {rk.text[:120]!r}\n"
+                     f"new              -> {fc} {rf.text[:120]!r}",
+            reproduction=f"POST {a.register_path} with an existing vs. a fresh email and diff.",
+            references=[REFS["A07"], REFS["ps-massassign"]],
+            tools=["Burp (Comparer)", "curl", "ffuf"],
+        )
+    else:
+        ctx.finding(
+            id="a07-register-user-enum", owasp="A07", severity="SAFE",
+            title="Registration response does not reveal existing accounts",
+            summary="Registering an existing vs. a new email produced an indistinguishable "
+                    "response — no registration enumeration oracle.",
         )
 
 

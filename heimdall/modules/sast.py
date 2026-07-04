@@ -385,10 +385,28 @@ def _route_decorator(dec: ast.AST):
     if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):
         return None
     verb = dec.func.attr.lower()
-    if verb not in ("get", "post", "put", "patch", "delete"):
+    if verb not in ("get", "head", "post", "put", "patch", "delete"):
         return None
     path = dec.args[0].value if (dec.args and isinstance(dec.args[0], ast.Constant)) else "?"
     return verb, path
+
+
+# ORM/DB write calls — a GET/HEAD handler that runs one is changing state over a
+# safe/idempotent HTTP method: CSRF-able (<img src>, link prefetch), cacheable,
+# and logged in URLs. `commit`/`flush` alone are conclusive (reads never commit).
+_DB_MUTATORS = frozenset({
+    "commit", "flush", "delete", "add", "add_all", "merge", "save", "remove",
+    "bulk_save_objects", "bulk_insert_mappings", "bulk_update_mappings", "destroy",
+})
+
+
+def _mutates_state(fn: ast.AST) -> bool:
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            tail = _callee(node).split(".")[-1]
+            if tail in _DB_MUTATORS:
+                return True
+    return False
 
 
 def _iter_py(root: str):
@@ -521,6 +539,11 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                         sinks.append({"kind": "noauth", "loc": f"{rel}:{node.lineno}",
                                       "code": f"{route[0].upper()} {route[1]}  ({node.name})",
                                       "func": node.name, "route": route})
+                elif route[0] in ("get", "head") and _mutates_state(node):
+                    # state-changing operation over a safe/idempotent method
+                    sinks.append({"kind": "state_change_get", "loc": f"{rel}:{node.lineno}",
+                                  "code": f"{route[0].upper()} {route[1]}  ({node.name})",
+                                  "func": node.name, "route": route})
                 break
 
     for i, line in enumerate(lines, 1):
@@ -870,8 +893,17 @@ _SPEC = {
                     "An X-Powered-By / Server / X-Runtime header advertises the framework and "
                     "version, easing targeted exploitation. Strip it in middleware.",
                     [REFS["A05"]], ["curl -I", "nikto"]),
+    "state_change_get": ("sast-state-changing-get", "A01", "MEDIUM",
+                         "State-changing operation exposed over HTTP GET",
+                         "A GET/HEAD handler performs a database write/delete/commit. Safe methods "
+                         "must not change state (RFC 9110): such a route is CSRF-able with no token "
+                         "(a bare <img>/link or a prefetching crawler triggers it), and the action "
+                         "leaks into URLs, logs, browser history and caches. Move the mutation to "
+                         "POST/PUT/PATCH/DELETE with CSRF protection.",
+                         [REFS["A01"], REFS.get("csrf", REFS["A01"])], ["code review", "Burp"]),
 }
-_ORDER = ["cmdi", "eval", "deser", "ssti", "sqli", "commented_auth", "ssrf", "noauth", "header_leak"]
+_ORDER = ["cmdi", "eval", "deser", "ssti", "sqli", "commented_auth", "ssrf", "noauth",
+          "state_change_get", "header_leak"]
 _CONFIRMABLE = {"cmdi", "ssti", "sqli", "noauth", "ssrf"}
 # When a sink is CONFIRMED live, elevate severity.
 _ELEVATE = {"ssti": "CRITICAL", "sqli": "CRITICAL", "noauth": "HIGH", "cmdi": "CRITICAL",

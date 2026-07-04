@@ -345,6 +345,75 @@ def test_sast_skips_migration_dirs(tmp_path):
     assert scanned == []                 # whole revisions subtree skipped
 
 
+def test_sast_flags_state_changing_get(tmp_path):
+    """A GET/HEAD handler that performs a DB mutation (delete/commit) is a
+    state-changing safe-method route — CSRF-able; read-only GETs are not."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "m.py").write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.get('/books/{id}/delete')\n"
+        "def delete_book(id, db):\n"
+        "    db.delete(book)\n"                       # mutation over GET
+        "    db.commit()\n"
+        "    return 1\n"
+        "@router.get('/books/{id}')\n"
+        "def read_book(id, db):\n"
+        "    return db.query(Book).get(id)\n"         # read-only GET
+        "@router.get('/new')\n"
+        "def new_form(request):\n"
+        "    return render('form.html')\n"            # pure render
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    codes = [c for _, c in hits.get("state_change_get", [])]
+    assert len(codes) == 1
+    assert "/books/{id}/delete" in codes[0]
+
+
+def test_a07_register_enumeration(monkeypatch):
+    """Registration that answers differently for an existing vs a fresh email is
+    an enumeration oracle; a uniform generic response is not."""
+    from heimdall.core.context import Context
+    from heimdall.core.model import AppProfile
+    from heimdall.modules import a07_auth as a07
+
+    class _Resp:
+        def __init__(self, code, text=""):
+            self.status_code, self.text = code, text
+
+    class _P:
+        email = "known@example.com"
+
+    def _wire(ctx, responder):
+        ctx.auth.register_path = "/auth/register"
+        monkeypatch.setattr(ctx, "principal", lambda *a, **k: _P())
+        monkeypatch.setattr(ctx, "post", responder)
+
+    # oracle: existing email -> 400 "already registered", fresh -> 201
+    ctx = Context(AppProfile(base_url="http://x"))
+    seen = set()
+    def leak(path, json=None, data=None, **k):
+        email = (json or data or {}).get("email", "")
+        if email in seen:                    # second time this email is seen -> "exists"
+            return _Resp(400, '{"detail":"Email already registered"}')
+        seen.add(email)
+        return _Resp(201, '{"id":9}')
+    _wire(ctx, leak)
+    a07._register_enum(ctx)
+    fs = [f for f in ctx.findings() if f.id == "a07-register-user-enum"]
+    assert fs and fs[0].severity.upper() == "LOW"
+
+    # no oracle: identical generic 200 for both
+    ctx2 = Context(AppProfile(base_url="http://x"))
+    _wire(ctx2, lambda *a, **k: _Resp(200, '{"status":"ok"}'))
+    a07._register_enum(ctx2)
+    fs2 = [f for f in ctx2.findings() if f.id == "a07-register-user-enum"]
+    assert fs2 and fs2[0].severity.upper() == "SAFE"
+
+
 def test_a07_skips_rate_limit_when_no_credential_evaluation(monkeypatch):
     """All-422 responses mean the endpoint never processed a login (or discovery
     mis-identified a CRUD route as login) — don't report a missing throttle."""
