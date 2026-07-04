@@ -80,7 +80,14 @@ def _select_targets(ctx: Context) -> list:
     behavioural."""
     gets = [r for r in ctx.routes if r.method == "GET" and not r.has_path_param]
     writes = [r for r in ctx.routes if r.method in ("POST", "PUT", "PATCH")]
-    return gets + writes[:12]
+    # Reserve budget for writes: a poisoned Host reflected into a reset/verify LINK
+    # (a POST — password-reset takeover) is the highest-impact host-header sink, so
+    # writes must not be starved out of the cap by a long list of GETs. Give writes
+    # up to half the budget (more if there are few GETs), then fill with GETs. Writes
+    # go first so they're always probed.
+    w = writes[:max(_MAX_TARGETS // 2, _MAX_TARGETS - len(gets))]
+    g = gets[:max(0, _MAX_TARGETS - len(w))]
+    return w + g
 
 
 # ── probing ──────────────────────────────────────────────────────────────────

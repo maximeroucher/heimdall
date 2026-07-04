@@ -339,6 +339,14 @@ def _admin_principal(ctx: Context):
 _BOGUS_ID = "00000000-0000-0000-0000-0000000000ff"
 
 
+def _bogus_like(real_id) -> str:
+    """A nonexistent id of the SAME shape as the victim's real one. An integer
+    path param (``user_id: int``) 422-rejects a UUID before the handler runs, so a
+    fixed-UUID bogus probe would read as 'rejected for the wrong reason' and mask a
+    real write-BOLA. Match the type: a big int for numeric ids, else the UUID."""
+    return "999999999" if str(real_id).isdigit() else _BOGUS_ID
+
+
 def _write_bola(ctx: Context) -> None:
     """Cross-principal PATCH/PUT/DELETE: can attacker A mutate victim B's object?
     Higher impact than a read BOLA. Destructive, so FULL mode only. Uses B's
@@ -366,7 +374,7 @@ def _write_bola(ctx: Context) -> None:
         try:
             vic = ctx.request(r.method, r.fill_path({pname: victim.user_id}),
                               token=attacker.token, json=body)
-            bog = ctx.request(r.method, r.fill_path({pname: _BOGUS_ID}),
+            bog = ctx.request(r.method, r.fill_path({pname: _bogus_like(victim.user_id)}),
                               token=attacker.token, json=body)
         except Exception as exc:  # noqa: BLE001
             ctx.note(f"write-BOLA probe of {r.method} {r.path} errored: {exc}")

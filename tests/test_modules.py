@@ -209,6 +209,96 @@ def test_a03_reflected_xss_via_get_flags_html_not_json():
         Resp("text/html", "<h1>Hello &lt;script&gt;heimdallx0&lt;/script&gt;</h1>"), P)
 
 
+def test_resource_consumption_capped_pagination_is_not_flagged():
+    """A larger page value returning MORE items isn't proof of 'no maximum': a
+    CAPPED endpoint (`limit=1_000_000` → 100 items) also returns more than
+    `limit=1`. Only flag when the absurd size was actually honoured (a large
+    fraction of it came back), else capped pagination is a false positive."""
+    from heimdall.modules import resource_consumption as rc
+
+    class _Resp:
+        def __init__(self, n):
+            self._n = n
+            self.status_code = 200
+            self.content = b"x" * n
+
+        def json(self):
+            return list(range(self._n))
+
+    class _Route:
+        path_params = []
+
+        def fill_path(self, d):
+            return "/feed"
+
+    class _Ctx:
+        def __init__(self, cap):
+            self.cap = cap
+
+        def get(self, path, params=None, token=None, timeout=None, retry_429=None):
+            asked = next(iter((params or {}).values()), 0)
+            return _Resp(min(asked, self.cap))
+
+    route = _Route()
+    # capped at 100: huge(1e6) -> 100 items -> NOT unbounded
+    assert rc._probe_pagination(_Ctx(100), route, "limit", None) is None
+    # truly uncapped: huge -> ~_ABSURD items -> flagged
+    assert rc._probe_pagination(_Ctx(rc._ABSURD * 9), route, "limit", None) is not None
+
+
+def test_a01_write_bola_bogus_id_matches_param_type():
+    """The bogus-id discriminator must match the path param's type. A hardcoded
+    UUID 422s an integer id param (`user_id: int`) BEFORE the handler, which read
+    as 'rejected for the wrong reason' and masked real write-BOLA on the most
+    common id shape. Numeric ids get a big-int bogus; others keep the UUID."""
+    from heimdall.modules.a01_access_control import _BOGUS_ID, _bogus_like
+
+    assert _bogus_like("3") == "999999999"          # int route -> big int (404, not 422)
+    assert _bogus_like(42) == "999999999"
+    assert _bogus_like("a1b2c3d4-uuid") == _BOGUS_ID  # non-numeric id -> keep the UUID
+
+
+def test_mass_assignment_fresh_identity_is_unique_per_create(monkeypatch):
+    """Repeated baseline+inject creates must use UNIQUE identity values, else a
+    username/email UNIQUE constraint 409s the repeats — which read as 'endpoint
+    unreachable' / 'field rejected' and hid real over-binding. Only identity-ish
+    fields are varied; other body fields (password) are left to build_request."""
+    from heimdall.modules import mass_assignment as ma
+
+    monkeypatch.setattr(ma, "body_field_names", lambda r: ["username", "email", "password"])
+    a = ma._fresh_identity(None)
+    b = ma._fresh_identity(None)
+    assert a["username"] != b["username"]      # distinct per create → no 409 collision
+    assert a["email"] != b["email"]
+    assert "password" not in a                 # non-identity fields untouched
+
+
+def test_a07_account_enum_uses_any_authed_when_no_attacker(monkeypatch):
+    """Login enumeration must be testable from any authenticated principal — not
+    only a self-registered attacker (absent under --no-attacker, and deletable by
+    the BOLA probe). Existing acct -> 401, unknown -> 404: the difference flags."""
+    from heimdall.core.context import Context
+    from heimdall.core.model import AppProfile, Principal
+    from heimdall.modules import a07_auth as a07
+
+    class _Resp:
+        def __init__(self, code, text=""):
+            self.status_code = code
+            self.text = text
+
+    prof = AppProfile(base_url="http://x")
+    prof.principals["alice"] = Principal(label="alice", role="user", username="alice",
+                                         password="pw", token="t")   # authed, no email
+    ctx = Context(prof)
+    ctx.auth.login_path = "/auth/login"
+    monkeypatch.setattr(a07, "_login_attempt",
+                        lambda c, ident, pw, **k: _Resp(401, "wrong password")
+                        if ident == "alice" else _Resp(404, "no such user"))
+    a07._account_enum(ctx)
+    assert any(f.id == "a07-login-user-enum" and f.severity != "SAFE"
+               for f in ctx.findings())
+
+
 def test_host_header_body_reflection_requires_url_context():
     """A poisoned Host reflected into a body URL (reset link) flags; a debug /
     header-echo endpoint that merely mirrors the request header value as JSON or

@@ -23,6 +23,9 @@ internal_status …) without naming any of them. Writes objects → FULL mode on
 
 from __future__ import annotations
 
+import itertools
+import os
+
 import requests
 
 from ..core.context import Context
@@ -34,6 +37,30 @@ from .base import module
 _MARK_STR = "heimdall_ma"
 _MARK_NUM = 1337421
 _MAX_ROUTES = 30
+
+# Field-name hints for values a UNIQUE constraint is likely to reject on repeat.
+_UNIQUE_HINT = ("username", "user_name", "login", "handle", "nickname", "slug", "name")
+_SEQ = itertools.count(1)
+# Per-process tag so identities don't collide with accounts a PRIOR scan left in
+# the target (the counter alone resets each run and would reuse the same names).
+_RUN_TAG = f"{os.getpid():x}"
+
+
+def _fresh_identity(route) -> dict:
+    """Unique values for identity-like request fields, so a UNIQUE constraint (a
+    username/email/slug already taken) doesn't 409 our repeated baseline+inject
+    creates — which would otherwise read as 'endpoint unreachable' or 'injected
+    field rejected' and hide a real mass assignment. These are request-declared
+    fields, never the injected server-only ones, so varying them is safe."""
+    n = next(_SEQ)
+    out = {}
+    for f in body_field_names(route):
+        fl = f.lower()
+        if "email" in fl or "mail" in fl:
+            out[f] = f"heimdall.ma.{_RUN_TAG}.{n}@example.com"
+        elif any(h in fl for h in _UNIQUE_HINT):
+            out[f] = f"heimdall_ma_{_RUN_TAG}_{n}"
+    return out
 
 
 @module("mass-assignment", "Mass Assignment", destructive=True)
@@ -94,8 +121,12 @@ def _discover(ctx: Context) -> list[tuple]:
 
 def _fire(ctx, route, token, overrides):
     path = route.fill_path({p: "1" for p in route.path_params})
+    # Fresh identity per create (unique username/email/…) merged UNDER the caller's
+    # overrides, so the injected server-only fields still win but uniqueness
+    # constraints don't spuriously 409 the repeat creates.
+    merged = {**_fresh_identity(route), **overrides}
     try:
-        _, body = build_request(ctx, route, token, overrides=overrides)
+        _, body = build_request(ctx, route, token, overrides=merged)
         resp = ctx.request(route.method, path, token=token, json=body,
                            timeout=12, retry_429=False)
     except requests.RequestException:

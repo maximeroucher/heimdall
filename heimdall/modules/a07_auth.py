@@ -241,11 +241,14 @@ def _timed_login(ctx: Context, ident: str, pw: str) -> tuple[int, str, float]:
 
 def _account_enum(ctx: Context) -> None:
     """Do existing vs. nonexistent identities look different at login?"""
-    attacker = ctx.principal("attacker", "user")
-    if not attacker or not attacker.email:
+    # Any authenticated principal is a valid "known-existing account" — fall back
+    # to a supplied credential when there's no self-registered attacker (e.g. run
+    # with --no-attacker), instead of skipping the check entirely.
+    attacker = ctx.principal("attacker", "user") or ctx.profile.any_authed()
+    known = getattr(attacker, "email", None) or getattr(attacker, "username", None) if attacker else None
+    if not known:
         ctx.note("no known-existing account available; enumeration check skipped")
         return
-    known = attacker.email
     absent = f"heimdall.ghost+{_next_suffix(ctx)}@example.com"
     try:
         k_code, k_body, k_t = _timed_login(ctx, known, "definitely-wrong-pw")

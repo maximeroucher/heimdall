@@ -114,12 +114,15 @@ def _probe_pagination(ctx, route, param, token) -> dict | None:
     if low.status_code >= 400:
         return None
     c_low, c_high = _count(low), _count(huge)
-    # Behavioural proof of a page-size control: a larger value returns MORE items
-    # (a filter/other numeric param would not), AND the absurd value is accepted
-    # rather than clamped/rejected → no server-side maximum. This never inspects
-    # the parameter's name.
+    # Behavioural proof of an UNCAPPED page size: a larger value returns MORE items
+    # (a filter/other numeric param would not), the absurd value is accepted, AND
+    # the response actually honoured the absurd size — it returned a large fraction
+    # of what was asked, not a small fixed cap. Requiring `c_high >= _ABSURD // 10`
+    # is what kills the false positive on a CAPPED endpoint (`limit=1_000_000`
+    # returning 100 items is the cap working, not an unbounded control). Never
+    # inspects the parameter's name.
     if (c_low is not None and c_high is not None and c_high > c_low
-            and huge.status_code < 400):
+            and huge.status_code < 400 and c_high >= _ABSURD // 10):
         return {"route": route, "param": param, "base_items": c_low,
                 "huge_items": c_high, "huge_bytes": len(huge.content)}
     return None
