@@ -186,8 +186,10 @@ def detect_db_kind(source_path: str | None, db_url: str | None = None) -> str | 
 
 
 _DB_ENV_RE = re.compile(
-    r"""(?:getenv|environ\.get)\(\s*["']([A-Z][A-Z0-9_]*)["']"""
-    r"""|environ\[\s*["']([A-Z][A-Z0-9_]*)["']\s*\]""")
+    r"""(?:getenv|environ\.get)\(\s*["']([A-Z][A-Z0-9_]*)["']"""       # os.getenv("X")
+    r"""|environ\[\s*["']([A-Z][A-Z0-9_]*)["']\s*\]"""                 # os.environ["X"]
+    r"""|(?:^|[^\w.])config\(\s*["']([A-Z][A-Z0-9_]*)["']"""          # decouple config("X")
+    r"""|\benv\s*=\s*["']([A-Z][A-Z0-9_]*)["']""")                    # pydantic Field(env="X")
 
 
 def detect_db_env_vars(source_path: str | None) -> set[str]:
@@ -210,7 +212,7 @@ def detect_db_env_vars(source_path: str | None) -> set[str]:
             except OSError:
                 continue
             for m in _DB_ENV_RE.finditer(txt):
-                name = m.group(1) or m.group(2)
+                name = m.group(1) or m.group(2) or m.group(3) or m.group(4)
                 if name and any(k in name for k in kw):
                     out.add(name)
             n += 1

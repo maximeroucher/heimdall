@@ -82,7 +82,7 @@ _PUBLIC_ROUTE = re.compile(
     # login/token/session, registration, and password/confirmation flows. A
     # narrow list mis-flags every one of them as "missing auth".
     r"login|logout|log-?in|sign-?in|signin|\bauth\b|authenticate|auth[_-]?token|"
-    r"access[_-]?token|/token|refresh|session|register|signup|sign-?up|"
+    r"access[_-]?token|/token|refresh|session|regist(?:er|ration)|signup|sign-?up|"
     r"create[_-]?user|create[_-]?account|user[_-]?create|new[_-]?account|"
     r"password|passwd|reset.?password|forgot|recover|password.?recovery|verif|"
     r"validate[_-]?(email|account)|activate|confirm|resend|magic[_-]?link|otp|"
@@ -243,6 +243,20 @@ def _depends_is_auth(dep_call: ast.Call) -> bool:
     return _auth_ish(name)
 
 
+def _is_auth_dep_call(call: ast.AST) -> bool:
+    """True if a call is an auth dependency: ``Security(...)`` (FastAPI's
+    security-scoped dependency — auth BY DEFINITION, used for OAuth2/JWT/API-key
+    schemes) or ``Depends(<auth-ish callable>)``."""
+    if not isinstance(call, ast.Call) or not call.args:
+        return False
+    tail = _callee(call).split(".")[-1]
+    if tail == "Security":
+        return True
+    if tail == "Depends":
+        return _depends_is_auth(call)
+    return False
+
+
 def _collect_auth_aliases(tree: ast.AST, aliases: set) -> None:
     """Record module-level ``NAME = Annotated[T, Depends(<auth>)]`` aliases.
 
@@ -290,9 +304,8 @@ def _deps_list_has_auth(deps_node) -> bool:
     if deps_node is None:
         return False
     for sub in ast.walk(deps_node):
-        if isinstance(sub, ast.Call) and _callee(sub).split(".")[-1] == "Depends" and sub.args:
-            if _depends_is_auth(sub):
-                return True
+        if _is_auth_dep_call(sub):
+            return True
     return False
 
 
@@ -484,9 +497,8 @@ def _handler_has_auth(fn: ast.AST, aliases: set | tuple = ()) -> bool:
                 if isinstance(base, ast.Name) and base.id in aliases:
                     return True
     for sub in ast.walk(args):
-        if isinstance(sub, ast.Call) and _callee(sub).split(".")[-1] == "Depends" and sub.args:
-            if _depends_is_auth(sub):
-                return True
+        if _is_auth_dep_call(sub):
+            return True
     return False
 
 
@@ -497,9 +509,8 @@ def _decorator_deps_auth(dec: ast.AST) -> bool:
     if deps is None:
         return False
     for sub in ast.walk(deps):
-        if isinstance(sub, ast.Call) and _callee(sub).split(".")[-1] == "Depends" and sub.args:
-            if _depends_is_auth(sub):
-                return True
+        if _is_auth_dep_call(sub):
+            return True
     return False
 
 

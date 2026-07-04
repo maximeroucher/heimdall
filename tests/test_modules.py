@@ -553,6 +553,30 @@ def test_sast_sql_fstring_trusted_interpolation(tmp_path):
     assert "WHERE n" in sqli[0]
 
 
+def test_sast_security_dependency_and_registration_public(tmp_path):
+    """FastAPI `Security(...)` is an auth dependency (used for JWT/OAuth), and
+    `user_registration` is public-by-design (registration)."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "r.py").write_text(
+        "from fastapi import APIRouter, Security\n"
+        "router = APIRouter()\n"
+        "@router.delete('')\n"
+        "def delete_user(auth=Security(access_security)): ...\n"   # Security() -> authed
+        "@router.post('')\n"
+        "def user_registration(body): ...\n"                       # registration -> public
+        "@router.post('/widgets')\n"
+        "def make_widget(body): ...\n"                             # genuinely no auth
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    noauth = [c for _, c in hits.get("noauth", [])]
+    assert not any("delete_user" in c for c in noauth)          # Security() recognized
+    assert not any("user_registration" in c for c in noauth)    # registration public
+    assert any("make_widget" in c for c in noauth)              # still flagged
+
+
 def test_sast_keyword_path_and_router_include(tmp_path):
     """`@router.delete(path="/{id}")` and `include_router(router=child,
     dependencies=[Depends(auth)])` use keyword args — the path must be read and
