@@ -22,12 +22,14 @@ victim's data model. Heimdall doesn't. It **discovers** them:
 | Every route, method, required-auth, params, body schema | `GET /openapi.json` (every FastAPI app serves it) |
 | Login shape (JSON vs OAuth2 form vs `simple_token`) | Heuristic scoring over the OpenAPI operations |
 | Register / "current user" endpoints | Same |
+| Auth transport — bearer token **or** cookie-session | `securitySchemes` + the live login response (302/204 + `Set-Cookie` → cookie jar; `Authorization` scheme → token) |
 | JWT algorithm & claim shape | Decodes a real token minted through the login flow |
 | Candidate signing secrets, dependency stack | Optional white-box scan of the source tree (`--source`) |
 
 Modules then operate off that discovered map — so a check written once ("secured
 routes must reject anonymous callers") runs against the app, the app, or your app
-unchanged.
+unchanged. Auth-shape detection means the CSRF and session modules light up on a
+cookie-session app and stay quiet on a token API, with no per-app configuration.
 
 ## Install
 
@@ -56,8 +58,52 @@ heimdall --config examples/example.toml
 # Non-destructive pass, or scope to specific modules:
 heimdall --url http://127.0.0.1:8000 --safe
 heimdall --url http://127.0.0.1:8000 --only a01,a02
+heimdall --url http://127.0.0.1:8000 --skip race,cmdi,xxe
 heimdall --list-modules
 ```
+
+#### Full flag reference
+
+| Flag | Purpose |
+|---|---|
+| `--url URL` | Target base URL (required unless `--config` supplies it). |
+| `--source PATH` | Target source tree — enables white-box checks (JWT-secret recovery, `a06` components, `sast`). |
+| `--name NAME` | Friendly app name for the report. |
+| `--config FILE` | TOML/JSON target config (CLI flags override its fields). |
+| `--cred label:role:identifier:password` | A login credential; repeatable. `role` is free-form (`admin`, `user`, …) and drives BFLA/BOLA pairing. |
+| `--launch CMD` / `--launch-cwd DIR` | Boot the target with a shell command first (and its working dir), then tear it down after. |
+| `--spawn-db` / `--spawn-db-env VAR` | Spin up a throwaway DB matching the target's engine (Docker Postgres/MySQL/Mongo, or a SQLite file) and hand it to the target via `VAR` (default `SQLITE_DB`); torn down after. |
+| `--db-url URL` | An existing throwaway SQLAlchemy URL to provision into (use `postgresql+psycopg2://…`). |
+| `--provision N` / `--provision-admins N` | Insert N low-privilege (and N admin) test users straight into the DB, so BOLA/IDOR/BFLA checks have real cross-tenant subjects even when self-registration is closed. |
+| `--no-mint` | Don't mint API-scoped JWTs even if the signing secret is recovered. |
+| `--no-attacker` | Don't self-register a throwaway low-priv attacker account. |
+| `--safe` | Skip every mutating/destructive probe. |
+| `--only KEYS` / `--skip KEYS` | Comma-separated module keys to include / exclude. |
+| `--fail-on LEVEL` | CI gate severity (`none,info,low,medium,high,critical`; default `high`). |
+| `--baseline findings.json` | Suppress already-known findings; gate only on new ones. |
+| `--discover-only` | Print the discovered profile (routes, auth, secrets) and exit — no attacks. |
+| `--list-modules` | List registered modules and exit. |
+| `--i-have-authorization` | Permit a non-loopback target (authorized use only). |
+| `--out DIR` / `--no-color` | Report output dir (default `./heimdall-report`) / disable ANSI colour. |
+
+#### Provisioning & throwaway targets
+
+For a deep run against an app whose sign-up is closed (or to drive access-control
+checks across *many* distinct owners), let Heimdall build the world:
+
+```bash
+# Boot the app onto a throwaway DB, seed real principals, then attack — all disposable:
+heimdall --url http://127.0.0.1:8000 \
+         --launch 'uvicorn app.main:app --port 8000' --launch-cwd /path/to/App \
+         --spawn-db \
+         --provision 3 --provision-admins 1
+```
+
+`--provision` inserts distinct users (hashing passwords the way the app's own
+model expects) and logs each in through the real login flow, giving the `a01`
+BOLA/IDOR/BFLA probes genuine cross-user subjects. Combined with `--spawn-db` /
+`--launch`, a whole assessment — server, database, users — is created and torn
+down around a single command.
 
 ### Library
 
@@ -66,11 +112,13 @@ import heimdall
 
 result = heimdall.assess(
     base_url="http://127.0.0.1:8000",
-    source_path="/path/to/YourApp",
-    credentials=[("admin", "admin", "admin@you.io", "hunter2")],
+    source_path="/path/to/YourApp",              # optional white-box
+    credentials=[("admin", "admin", "admin@you.io", "hunter2")],  # label,role,id,pw
+    safe=False,                                  # True → skip destructive probes
+    only={"a01", "a02"},                         # or skip={"race", "cmdi"}
 )
 print(result.counts())            # {'CRITICAL': 1, 'HIGH': 3, 'SAFE': 9, ...}
-print(result.report_paths)        # (findings.json, REPORT.md)
+print(result.report_paths)        # (findings.json, REPORT.md, REPORT.html, findings.sarif)
 ```
 
 Drive discovery alone:
@@ -82,14 +130,45 @@ print(heimdall.summarize(profile))
 
 ## Modules
 
-| Key | OWASP | What it does |
+26 detectors, grouped by OWASP category. Run `heimdall --list-modules` for the
+live registry. Modules marked **⚡** are *destructive* (they mutate state) and are
+skipped under `--safe`.
+
+| Key | Title | What it does |
 |---|---|---|
-| `a01` | Broken Access Control | Unauth access to secured routes; BFLA on admin routes; IDOR on object-by-id routes |
-| `a02` | Cryptographic Failures | JWT `alg:none` forgery + weak-HS256-secret crack, proven by live acceptance; token-in-query |
-| `a03` | Injection | SQLi sweep (error/500-based) + reflected-XSS + operator-injection probes |
-| `a05` | Security Misconfiguration | CORS reflection, missing security headers, docs exposure, stack-trace/debug leaks |
-| `a06` | Vulnerable Components | `pip-audit` + heuristic version checks (needs `--source`) |
-| `a07` | Auth Failures | Login rate-limit + XFF bypass, user enumeration, register mass-assignment, weak passwords |
+| **A01 — Broken Access Control** | | |
+| `a01` | Access Control / IDOR | Unauth access to secured routes; BFLA on admin routes; BOLA/IDOR on object-by-id routes across owners |
+| `csrf` | Cross-Site Request Forgery | On cookie-session apps: session-cookie `SameSite` + anti-CSRF-token enforcement (auto-skipped for token auth) |
+| `data-exposure` | Excessive Data Exposure | Secrets/PII/other users' tokens in responses (own-token & public-metadata aware) |
+| `mass-assignment` ⚡ | Mass Assignment | Over-posting privileged fields (`is_admin`, `role`) on create/update, with a determinism gate |
+| `oidc` | OAuth / OIDC Flow | `state`/PKCE/`redirect_uri` handling on discovered OAuth flows |
+| `open-redirect` | Open Redirect | Redirect params that navigate off-host (parsed like a browser, not by substring) |
+| **A02 — Cryptographic Failures** | | |
+| `a02` | JWT forging | `alg:none` forgery + weak-HS256-secret crack, *proven by live acceptance*; token-in-query leak |
+| **A03 — Injection** | | |
+| `a03` | Injection | SQLi (error/boolean, reproducibility-gated) + reflected-XSS + SSTI + traversal + operator injection |
+| `sqli-blind` ⚡ | Blind SQLi | Time-based blind SQL injection |
+| `cmdi` ⚡ | OS Command Injection | Time-based OS command injection |
+| `xxe` ⚡ | XML External Entity | XXE file disclosure (structural passwd-line match) on XML-accepting routes |
+| `sast` | SAST → DAST chaining | Source-sink scan whose findings are re-probed live against the running app |
+| **A04 — Insecure Design** | | |
+| `business-logic` ⚡ | Numeric Abuse | Negative/overflow quantities & price/amount tampering |
+| `race` ⚡ | Race / TOCTOU | Concurrent double-spend; flags only *divergent* (cumulative) races, not idempotent ones |
+| `workflow` ⚡ | Multi-step Replay | Replaying a step for a double effect |
+| `resource-consumption` | Resource Consumption | Unbounded pagination / payload size / missing rate limits |
+| **A05 — Security Misconfiguration** | | |
+| `a05` | Misconfiguration | CORS reflection, missing security headers, docs exposure, stack-trace/debug leaks |
+| `host-header` | Host Header Attacks | Host/`X-Forwarded-Host` poisoning reflected into URLs |
+| `improper-inventory` | Sensitive Paths | Exposed `.env`/config/backup/VCS & undocumented admin surfaces |
+| `graphql` | GraphQL Exposure | Introspection, suggestions, unauth queries |
+| `websocket` | WebSocket Security | Origin/auth enforcement on discovered WS endpoints |
+| `file-upload` ⚡ | Unrestricted Upload | Dangerous file types accepted on upload sinks |
+| **A06 — Vulnerable Components** | | |
+| `a06` | Outdated Components | `pip-audit` + heuristic version checks (needs `--source`) |
+| **A07 — Authentication Failures** | | |
+| `a07` | Auth Failures | Login rate-limit + XFF bypass, user enumeration, weak passwords, lockout (429/423) vs OAuth-token endpoints |
+| `session` | Session Lifecycle | Token/session expiry, logout invalidation, rotation |
+| **A10 — SSRF** | | |
 | `a10` | SSRF | URL-accepting sink discovery + internal-target / cloud-metadata probes |
 
 Each module also emits **TESTED-SAFE** findings so the report distinguishes
@@ -132,10 +211,10 @@ only breaks on *new* ones. Upload `findings.sarif` with
 
 ```
 heimdall/
-  discovery/   openapi → RouteMap · auth detection · source secret scan → AppProfile
-  bootstrap/   launch target (optional) · mint principals via the real login flow
-  modules/     a01…a10, each reading the AppProfile — no hard-coded paths
-  core/        Context, Finding, report renderer, loopback guardrail, data model
+  discovery/   openapi → RouteMap · auth detection (token/cookie) · JWKS · source secret scan → AppProfile
+  bootstrap/   launch target · spawn throwaway DB · provision users · mint principals via the real login flow
+  modules/     26 detectors, each reading the AppProfile — no hard-coded paths
+  core/        Context, Finding, report renderer (MD/HTML/SARIF), attack-chain builder, loopback guardrail
   runner.py    launch → discover → bootstrap → modules → report
 ```
 
@@ -144,3 +223,5 @@ heimdall/
 Alpha. The discovery layer targets FastAPI/OpenAPI 3.x; the exploit modules are
 black-box-first and conservative about false positives (unconfirmed SSRF sinks,
 heuristic enumeration, etc. are labelled as needing manual/OAST confirmation).
+A 60+-case test suite (`pytest`) pins each module's precision — every
+false-positive fix ships with a false-negative control and a regression test.
