@@ -201,6 +201,7 @@ def _sast_full_scan(sast, src):
         parsed.append((sast._module_key(os.path.relpath(p, root)), tree))
     graph["protected_routers"] = sast._resolve_protected_routers(parsed, top_pkg)
     graph["auth_controllers"] = sast._resolve_auth_controllers(parsed)
+    graph["app_auth_middleware"] = sast._has_auth_middleware(parsed)
     for p in files:
         sast._scan_file(p, os.path.relpath(p, root), open(p).readlines(), graph)
     out = {}
@@ -551,6 +552,35 @@ def test_sast_sql_fstring_trusted_interpolation(tmp_path):
     sqli = [c for _, c in hits.get("sqli", [])]
     assert len(sqli) == 1
     assert "WHERE n" in sqli[0]
+
+
+def test_sast_auth_middleware_guards_routes(tmp_path):
+    """An app-wide authentication middleware guards every route (routes read
+    request.state.user, no Depends) — no-auth must not fire. Without it, the same
+    mutating route IS flagged."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "main.py").write_text(
+        "from fastapi import FastAPI, Request\n"
+        "app = FastAPI()\n"
+        "app.add_middleware(JWTAuthenticationMiddleware, backend=b, exclude_urls=['/login'])\n"
+        "@app.post('/items')\n"
+        "def create_item(request: Request): ...\n"       # middleware-guarded
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    assert "noauth" not in hits
+
+    (src / "main.py").write_text(                         # control: no auth middleware
+        "from fastapi import FastAPI\n"
+        "app = FastAPI()\n"
+        "app.add_middleware(GZipMiddleware)\n"            # a non-auth middleware
+        "@app.post('/items')\n"
+        "def create_item(body): ...\n"
+    )
+    hits2, _ = _sast_full_scan(sast, src)
+    assert any("/items" in c for _, c in hits2.get("noauth", []))
 
 
 def test_sast_security_dependency_and_registration_public(tmp_path):

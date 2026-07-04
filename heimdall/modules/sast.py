@@ -438,6 +438,26 @@ def _verifies_signature(tree: ast.AST) -> bool:
     return False
 
 
+# An app that installs an authentication MIDDLEWARE guards every route through it
+# (routes read request.state.user, no per-handler Depends) — the inverse of the
+# Depends model. When present, "missing auth" doesn't apply (public routes are
+# the middleware's exclude_urls, already covered by _PUBLIC_ROUTE).
+_AUTH_MW_RE = re.compile(r"auth|jwt|oauth|security|login|identity|principal|bearer",
+                         re.IGNORECASE)
+
+
+def _has_auth_middleware(parsed: list) -> bool:
+    for _mk, tree in parsed:
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and _callee(node).split(".")[-1] == "add_middleware"
+                    and node.args):
+                mw = node.args[0]
+                name = mw.id if isinstance(mw, ast.Name) else getattr(mw, "attr", "")
+                if name and _AUTH_MW_RE.search(name):
+                    return True
+    return False
+
+
 def _resolve_auth_controllers(parsed: list) -> set:
     """Class-based-view controller classes whose routes are authenticated because
     the class (or an ancestor) declares an auth dependency as a CLASS ATTRIBUTE —
@@ -609,6 +629,7 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
     _collect_auth_aliases(tree, aliases)  # also catch same-file alias defs
     protected = graph.get("protected_routers", frozenset())
     auth_controllers = graph.get("auth_controllers", frozenset())
+    app_auth_mw = graph.get("app_auth_middleware", False)
     module_key = _module_key(rel)
     sig_authed = _verifies_signature(tree)  # webhook HMAC auth in this module
 
@@ -708,7 +729,7 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                     router_authed = rvar is not None and (module_key, rvar) in protected
                     cbv_authed = enclosing_class(node) in auth_controllers
                     if not (_handler_has_auth(node, aliases) or _decorator_deps_auth(dec)
-                            or router_authed or sig_authed or cbv_authed) and not public:
+                            or router_authed or sig_authed or cbv_authed or app_auth_mw) and not public:
                         sinks.append({"kind": "noauth", "loc": f"{rel}:{node.lineno}",
                                       "code": f"{route[0].upper()} {route[1]}  ({node.name})",
                                       "func": node.name, "route": route})
@@ -1124,6 +1145,8 @@ def run(ctx: Context) -> None:
     graph["protected_routers"] = _resolve_protected_routers(parsed, top_pkg)
     # class-based-view controllers whose auth is a class-attribute dependency
     graph["auth_controllers"] = _resolve_auth_controllers(parsed)
+    # an app-wide authentication middleware guards every route
+    graph["app_auth_middleware"] = _has_auth_middleware(parsed)
     if parse_failures:
         ctx.note(f"{parse_failures} source file(s) did not parse on the analyzer's "
                  "Python; used text-fallback for auth aliases")
