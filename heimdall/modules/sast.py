@@ -178,6 +178,49 @@ def _reads_file(value: ast.AST | None) -> bool:
     return False
 
 
+_DB_SCALAR_READS = ("scalar", "scalar_one", "scalar_one_or_none", "fetchone", "fetchval",
+                    "first", "one", "one_or_none")
+
+
+def _trusted_value(v: ast.AST | None) -> bool:
+    """A value with no request-derived taint: a literal, an attribute (self.x /
+    Model.X), a DB scalar read, or a boolean/conditional combination of those
+    (e.g. ``self._initial_fk_state or "origin"``)."""
+    if isinstance(v, ast.Constant):
+        return True
+    if isinstance(v, ast.Attribute):
+        return True
+    if isinstance(v, ast.BoolOp):
+        return all(_trusted_value(x) for x in v.values)
+    if isinstance(v, ast.IfExp):
+        return _trusted_value(v.body) and _trusted_value(v.orelse)
+    if isinstance(v, ast.Call):
+        return _callee(v).split(".")[-1] in _DB_SCALAR_READS
+    return False
+
+
+def _sql_trusted_interp(a0: ast.AST, trusted_names: set | frozenset = frozenset()) -> bool:
+    """True if an f-string SQL argument interpolates ONLY trusted identifiers —
+    attribute access (``cls.x`` / ``Model.__tablename__``), an ALL_CAPS/dunder
+    constant, or a local proven trusted (assigned from a literal/attr/DB read).
+    These are table names / SET / PRAGMA values that can't be bound as parameters
+    and carry no request data. Concatenation / `%` / ``.format`` are NOT covered
+    here (they keep flagging as dynamic builds)."""
+    if not isinstance(a0, ast.JoinedStr):
+        return False
+    fvs = [v.value for v in a0.values if isinstance(v, ast.FormattedValue)]
+    if not fvs:
+        return False
+    for e in fvs:
+        if isinstance(e, ast.Attribute):
+            continue
+        if isinstance(e, ast.Name) and (e.id.isupper() or e.id.startswith("__")
+                                        or e.id in trusted_names):
+            continue
+        return False
+    return True
+
+
 def _kwarg(call: ast.Call, name: str):
     return next((k.value for k in call.keywords if k.arg == name), None)
 
@@ -286,6 +329,25 @@ def _resolve_protected_routers(parsed: list, top_pkg: str) -> set:
     """
     protected: set = set()
     edges: list = []                     # (parent_sym, child_sym, has_auth)
+
+    # Custom APIRouter subclasses that bake an auth dependency into their
+    # constructor (Mealie's `class UserAPIRouter(APIRouter): super().__init__(...,
+    # dependencies=[Depends(get_current_user)])`). Any `router = UserAPIRouter()`
+    # is then auth-protected even though the call site declares no dependency.
+    auth_router_classes: set = set()
+    for _mk, tree in parsed:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            base_names = {b.id if isinstance(b, ast.Name) else getattr(b, "attr", "")
+                          for b in node.bases}
+            if not any(bn == "APIRouter" or bn.endswith("Router") for bn in base_names):
+                continue
+            for sub in ast.walk(node):     # auth dep anywhere in the class ctor
+                if isinstance(sub, ast.Call) and _deps_list_has_auth(_kwarg(sub, "dependencies")):
+                    auth_router_classes.add(node.name)
+                    break
+
     for module_key, tree in parsed:
         alias_map: dict = {}             # local name -> (target_module, orig_name)
         for node in ast.walk(tree):
@@ -307,8 +369,10 @@ def _resolve_protected_routers(parsed: list, top_pkg: str) -> set:
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-                if (_callee(node.value).split(".")[-1] == "APIRouter"
-                        and _deps_list_has_auth(_kwarg(node.value, "dependencies"))):
+                callee_tail = _callee(node.value).split(".")[-1]
+                if ((callee_tail == "APIRouter"
+                     and _deps_list_has_auth(_kwarg(node.value, "dependencies")))
+                        or callee_tail in auth_router_classes):
                     for t in node.targets:
                         if isinstance(t, ast.Name):
                             protected.add((module_key, t.id))
@@ -352,6 +416,39 @@ def _verifies_signature(tree: ast.AST) -> bool:
             if "signature" in low and any(w in low for w in ("verif", "valid", "check")):
                 return True
     return False
+
+
+def _resolve_auth_controllers(parsed: list) -> set:
+    """Class-based-view controller classes whose routes are authenticated because
+    the class (or an ancestor) declares an auth dependency as a CLASS ATTRIBUTE —
+    e.g. Mealie's ``class BaseUserController: user = Depends(get_current_user)``,
+    injected into every @router method by the @controller/@cbv decorator. Public
+    controllers (no such attribute) are intentionally excluded.
+    """
+    base_auth: set = set()               # classes with a class-level Depends(auth)
+    bases_of: dict = {}                  # class name -> {base names}
+    for _mk, tree in parsed:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            bases_of.setdefault(node.name, set()).update(
+                b.id if isinstance(b, ast.Name) else getattr(b, "attr", "") for b in node.bases)
+            for stmt in node.body:       # class-body attribute = Depends(auth)?
+                val = getattr(stmt, "value", None) if isinstance(
+                    stmt, (ast.Assign, ast.AnnAssign)) else None
+                if (isinstance(val, ast.Call) and _callee(val).split(".")[-1] == "Depends"
+                        and val.args and _depends_is_auth(val)):
+                    base_auth.add(node.name)
+                    break
+    auth = set(base_auth)                # transitive: subclass of an auth base is auth
+    changed = True
+    while changed:
+        changed = False
+        for cls, bases in bases_of.items():
+            if cls not in auth and (bases & auth):
+                auth.add(cls)
+                changed = True
+    return auth
 
 
 def _decorator_router_var(dec: ast.AST) -> str | None:
@@ -473,23 +570,40 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
             n = getattr(n, "_parent", None)
         return None
 
+    def enclosing_class(node) -> str | None:
+        n = getattr(node, "_parent", None)
+        while n is not None:
+            if isinstance(n, ast.ClassDef):
+                return n.name
+            n = getattr(n, "_parent", None)
+        return None
+
     sinks = graph["sinks"]
     handlers = graph["handlers"]
     calls = graph["calls"]
     aliases = graph.setdefault("auth_aliases", set())
     _collect_auth_aliases(tree, aliases)  # also catch same-file alias defs
     protected = graph.get("protected_routers", frozenset())
+    auth_controllers = graph.get("auth_controllers", frozenset())
     module_key = _module_key(rel)
     sig_authed = _verifies_signature(tree)  # webhook HMAC auth in this module
 
     # per-function: local vars whose value is read from the filesystem
     file_vars: dict[str | None, set] = {}
+    # per-function: local vars proven to hold a non-request-tainted value
+    # (literal / attribute / DB scalar read) — trusted for SQL identifier interp
+    sql_trusted: dict[str | None, set] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and _reads_file(node.value):
+        if isinstance(node, ast.Assign):
             fn2 = enclosing_func(node)
-            for t in node.targets:
-                if isinstance(t, ast.Name):
-                    file_vars.setdefault(fn2, set()).add(t.id)
+            if _reads_file(node.value):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        file_vars.setdefault(fn2, set()).add(t.id)
+            if _trusted_value(node.value):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        sql_trusted.setdefault(fn2, set()).add(t.id)
 
     # module-level string constants: trusted template sources (e.g. a
     # developer-authored ``INCIDENT_SUMMARY_TEMPLATE = "..."``)
@@ -538,7 +652,12 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                 if _ssti_is_tainted(a0, fn, file_vars, module_consts):
                     add("ssti", node)
             elif tail in ("execute", "executemany", "executescript", "text", "raw") and _built_string(a0):
-                add("sqli", node)
+                # an f-string that only interpolates trusted identifiers (cls./
+                # self./Model.__tablename__ attributes or ALL_CAPS/dunder consts)
+                # is unavoidable identifier/config interpolation (table names, SET/
+                # PRAGMA), not injectable data. Concatenation/% keep flagging.
+                if not _sql_trusted_interp(a0, sql_trusted.get(fn, frozenset())):
+                    add("sqli", node)
             elif name in ("eval", "exec") and _dynamic(a0):
                 add("eval", node)
             elif name in ("pickle.loads", "cPickle.loads", "marshal.loads", "dill.loads",
@@ -563,8 +682,9 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                               or _CAP_TOKEN_PARAM.search(route[1]))
                     rvar = _decorator_router_var(dec)
                     router_authed = rvar is not None and (module_key, rvar) in protected
+                    cbv_authed = enclosing_class(node) in auth_controllers
                     if not (_handler_has_auth(node, aliases) or _decorator_deps_auth(dec)
-                            or router_authed or sig_authed) and not public:
+                            or router_authed or sig_authed or cbv_authed) and not public:
                         sinks.append({"kind": "noauth", "loc": f"{rel}:{node.lineno}",
                                       "code": f"{route[0].upper()} {route[1]}  ({node.name})",
                                       "func": node.name, "route": route})
@@ -978,6 +1098,8 @@ def run(ctx: Context) -> None:
             parse_failures += 1
     # routers that inherit auth via composition (include_router(dependencies=...))
     graph["protected_routers"] = _resolve_protected_routers(parsed, top_pkg)
+    # class-based-view controllers whose auth is a class-attribute dependency
+    graph["auth_controllers"] = _resolve_auth_controllers(parsed)
     if parse_failures:
         ctx.note(f"{parse_failures} source file(s) did not parse on the analyzer's "
                  "Python; used text-fallback for auth aliases")

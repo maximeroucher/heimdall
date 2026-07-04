@@ -103,6 +103,7 @@ def _sast_full_scan(sast, src):
         sast._collect_auth_aliases(tree, graph["auth_aliases"])
         parsed.append((sast._module_key(os.path.relpath(p, root)), tree))
     graph["protected_routers"] = sast._resolve_protected_routers(parsed, top_pkg)
+    graph["auth_controllers"] = sast._resolve_auth_controllers(parsed)
     for p in files:
         sast._scan_file(p, os.path.relpath(p, root), open(p).readlines(), graph)
     out = {}
@@ -366,6 +367,78 @@ def test_sast_skips_migration_dirs(tmp_path):
     )
     scanned = [p for p in sast._iter_py(str(src))]
     assert scanned == []                 # whole revisions subtree skipped
+
+
+def test_sast_auth_router_subclass_and_cbv_controller(tmp_path):
+    """Mealie-style auth: an APIRouter SUBCLASS that bakes the auth dep into its
+    constructor, and a class-based-view controller whose base class carries the
+    auth dep as a class attribute — both authenticate their routes."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "routers.py").write_text(
+        "from fastapi import APIRouter, Depends\n"
+        "class UserAPIRouter(APIRouter):\n"
+        "    def __init__(self, **kw):\n"
+        "        super().__init__(dependencies=[Depends(get_current_user)], **kw)\n"
+    )
+    (src / "base.py").write_text(
+        "from fastapi import Depends\n"
+        "class BaseUserController:\n"
+        "    user = Depends(get_current_user)\n"        # CBV class-attr auth
+        "class BasePublicController:\n"
+        "    pass\n"                                     # no auth
+    )
+    (src / "routes.py").write_text(
+        "from routers import UserAPIRouter\n"
+        "from fastapi import APIRouter\n"
+        "from base import BaseUserController, BasePublicController\n"
+        "srouter = UserAPIRouter(prefix='/s')\n"
+        "@srouter.post('')\n"
+        "def create_s(data): ...\n"                      # authed via subclass router
+        "prouter = APIRouter(prefix='/p')\n"
+        "@controller(prouter)\n"
+        "class SecureCtl(BaseUserController):\n"
+        "    @prouter.delete('/{id}')\n"
+        "    def remove(self, id): ...\n"                # authed via CBV base class
+        "orouter = APIRouter(prefix='/o')\n"
+        "@controller(orouter)\n"
+        "class OpenCtl(BasePublicController):\n"
+        "    @orouter.post('/act')\n"
+        "    def act(self, data): ...\n"                 # public controller -> flagged
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    noauth = [c for _, c in hits.get("noauth", [])]
+    assert not any("/s" in c and "create_s" in c for c in noauth)   # subclass router
+    assert not any("remove" in c for c in noauth)                   # CBV base auth
+    assert any("act" in c for c in noauth)                          # public ctl flagged
+
+
+def test_sast_sql_fstring_trusted_interpolation(tmp_path):
+    """f-string SQL interpolating only trusted identifiers (attributes, consts,
+    trusted locals) is not SQLi; a request-derived value is."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "q.py").write_text(
+        "from sqlalchemy import text\n"
+        "def a(session, cls):\n"
+        "    session.execute(text(f'SET x = {cls._threshold}'))\n"          # attr -> safe
+        "def b(session, Model):\n"
+        "    session.execute(text(f'SELECT id FROM {Model.__tablename__}'))\n"  # dunder -> safe
+        "def c(session):\n"
+        "    state = self._fk or 'origin'\n"
+        "    session.execute(text(f'SET role = {state}'))\n"                # trusted local
+        "def d(session, request):\n"
+        "    name = request['q']\n"
+        "    session.execute(text(f\"SELECT * FROM t WHERE n = '{name}'\"))\n"  # tainted!
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    sqli = [c for _, c in hits.get("sqli", [])]
+    assert len(sqli) == 1
+    assert "WHERE n" in sqli[0]
 
 
 def test_sast_public_auth_account_routes_suppressed(tmp_path):
