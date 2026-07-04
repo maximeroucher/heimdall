@@ -51,6 +51,12 @@ _SKIP_DIRS = {
     # offline DB schema/DDL scripts — run by an admin, never reachable from an
     # HTTP request, so their f-string DDL is not a web-exploitable SQLi sink
     "revisions", "versions", "alembic",
+    # developer/build tooling — code-generation, stress-test harnesses, example
+    # snippets, docs, benchmarks. Their requests.get / os.system / f-string SQL
+    # run at dev time, never from an HTTP handler, so flagging them as app SSRF /
+    # cmdi / SQLi sinks is a false positive (they aren't in the request path).
+    "dev", "scripts", "tools", "tooling", "examples", "example", "docs",
+    "benchmarks", "benchmark", "code-generation", "codegen",
 }
 _MAX_FILES = 3000
 _PS_CMDI = "https://portswigger.net/web-security/os-command-injection"

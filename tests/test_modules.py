@@ -222,6 +222,35 @@ def test_open_redirect_matches_effective_nav_host_not_substring():
     assert not hit(Resp(200, body=f"<p>never visit {C}</p>"))          # mention, no redirect
 
 
+def test_sast_skips_developer_tooling_dirs(tmp_path):
+    """SAST must not scan developer tooling (dev/, scripts/, code-generation, …):
+    their requests.get / os.system run at dev time, never from an HTTP handler, so
+    flagging them as app SSRF/cmdi sinks is a false positive."""
+    from heimdall.modules.sast import _iter_py
+
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "main.py").write_text("x = 1\n")
+    for d in ("dev", "scripts", "tools", "examples", "docs"):
+        sub = tmp_path / d
+        sub.mkdir()
+        (sub / "gen.py").write_text("import requests; requests.get(url)\n")
+    (tmp_path / "dev" / "code-generation").mkdir()
+    (tmp_path / "dev" / "code-generation" / "x.py").write_text("requests.get(u)\n")
+
+    scanned = {p.replace(str(tmp_path) + "/", "") for p in _iter_py(str(tmp_path))}
+    assert scanned == {"app/main.py"}, scanned
+
+
+def test_a07_recognizes_lockout_and_rate_limit_status_codes():
+    """Brute-force protection is signalled by 429 (IP/global rate limit) AND 423
+    (per-account lockout — the common FastAPI defence). Recognising only 429 would
+    false-positive 'no rate limiting' on every lockout-based app (e.g. mealie)."""
+    from heimdall.modules.a07_auth import _THROTTLE_CODES
+
+    assert 429 in _THROTTLE_CODES
+    assert 423 in _THROTTLE_CODES
+
+
 def test_data_exposure_own_token_skipped_cross_user_flagged():
     """A JWT echoed on a /me or token-refresh response that carries the CALLER's
     own identity is not a leak; another user's token (or a token when we hold no

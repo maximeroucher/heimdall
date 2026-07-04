@@ -78,21 +78,34 @@ def run(ctx: Context) -> None:
     _weak_password(ctx)
 
 
+# Status codes that signal brute-force protection engaged: 429 Too Many Requests
+# (IP/global rate limit) and 423 Locked (per-account lockout — the most common
+# FastAPI defence). Recognising only 429 misses lockout-based apps entirely.
+_THROTTLE_CODES = frozenset({429, 423})
+
+
 def _brute_force(ctx: Context) -> None:
-    """~12 rapid bogus logins should trip a 429; if one does, test XFF bypass."""
-    attacker = ctx.principal("attacker", "user")
-    # Use the attacker's own email (or a throwaway) so we never lock out a real
-    # user — a wrong password against our own account is harmless.
-    ident = (attacker.email if attacker and attacker.email
+    """~12 rapid bogus logins should trip a throttle/lockout; if one does, test
+    XFF bypass. Hammer an account we CONTROL that actually EXISTS, so per-account
+    lockout can trip — a non-existent identifier can't be locked and would read
+    as a false 'no throttle'."""
+    princ = ctx.principal("attacker", "user") or ctx.profile.any_authed()
+    # An existing account we own (a wrong password against it is harmless, and it
+    # is the ONLY way to exercise per-account lockout). Synthetic address only if
+    # we hold no authenticated principal at all (then only IP throttles show up).
+    ident = (princ.email if princ and getattr(princ, "email", None)
              else f"heimdall.bruteforce+{_next_suffix(ctx)}@example.com")
     codes: list[int] = []
     tripped_at = None
+    trip_code = None
     try:
         for i in range(12):
             resp = _login_attempt(ctx, ident, f"wrong-pw-{i}")
             codes.append(resp.status_code)
-            if resp.status_code == 429 and tripped_at is None:
+            if resp.status_code in _THROTTLE_CODES:
                 tripped_at = i + 1
+                trip_code = resp.status_code
+                break        # stop as soon as the defence engages (minimise lockout)
     except Exception as e:  # noqa: BLE001
         ctx.note(f"login brute-force probe errored: {e}")
         return
@@ -129,22 +142,30 @@ def _brute_force(ctx: Context) -> None:
         )
         return
 
-    # Rate limiting fired — good. Now see whether it is keyed on a spoofable
-    # client-supplied header (X-Forwarded-For), which trivially defeats it.
+    # Protection fired — good. 423 is a per-ACCOUNT lockout (keyed on identity,
+    # not IP), so an X-Forwarded-For rotation cannot bypass it by definition —
+    # only test the XFF bypass for an IP/global 429 limiter.
+    lock = trip_code == 423
     ctx.finding(
         id="a07-login-rate-limit",
         owasp="A07", severity="SAFE",
-        title=f"Login is rate-limited (429 after {tripped_at} attempts)",
-        summary=f"Repeated bogus logins for {ident!r} were throttled with HTTP 429 after "
+        title=(f"Login enforces {'per-account lockout (HTTP 423)' if lock else 'rate limiting (HTTP 429)'} "
+               f"after {tripped_at} attempts"),
+        summary=f"Repeated bogus logins for {ident!r} were "
+                f"{'locked out (HTTP 423)' if lock else 'throttled (HTTP 429)'} after "
                 f"{tripped_at} attempts — brute-force protection is active.",
     )
+    if lock:
+        ctx.note("a07: login protection is a per-account lockout (423); X-Forwarded-For "
+                 "bypass test skipped (a per-account lock is not IP-keyed)")
+        return
     try:
         evaded = []
         for i in range(1, 21):
             xff = f"10.0.0.{i}"
             resp = _login_attempt(ctx, ident, f"xff-pw-{i}",
                                   headers={"X-Forwarded-For": xff})
-            if resp.status_code != 429:
+            if resp.status_code != trip_code:
                 evaded.append((xff, resp.status_code))
     except Exception as e:  # noqa: BLE001
         ctx.note(f"X-Forwarded-For bypass probe errored: {e}")
