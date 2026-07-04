@@ -236,8 +236,16 @@ def _auth_ish(name: str) -> bool:
     return bool(_AUTH_NAME_RE.search(name))
 
 
+def _unwrap_partial(node: ast.AST | None) -> ast.AST | None:
+    """`functools.partial(require_role, "admin")` -> the `require_role` callable —
+    the common way to parameterise an auth dependency."""
+    if isinstance(node, ast.Call) and _callee(node).split(".")[-1] == "partial" and node.args:
+        return node.args[0]
+    return node
+
+
 def _depends_is_auth(dep_call: ast.Call) -> bool:
-    d = dep_call.args[0] if dep_call.args else None
+    d = _unwrap_partial(dep_call.args[0] if dep_call.args else None)
     name = (d.id if isinstance(d, ast.Name) else
             _callee(d) if isinstance(d, ast.Call) else getattr(d, "attr", "")) if d else ""
     return _auth_ish(name)
@@ -281,6 +289,19 @@ def _collect_auth_aliases(tree: ast.AST, aliases: set) -> None:
                     if isinstance(t, ast.Name):
                         aliases.add(t.id)
                 break
+
+    # propagate re-aliases: `B = A` where A is already an auth alias (and chains
+    # `C = B`), to a fixpoint.
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Name)
+                    and node.value.id in aliases):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id not in aliases:
+                        aliases.add(t.id)
+                        changed = True
 
 
 # fallback when a file won't ``ast.parse`` (e.g. target uses a newer Python's
@@ -554,12 +575,15 @@ def _handler_has_auth(fn: ast.AST, aliases: set | tuple = ()) -> bool:
     return False
 
 
-def _decorator_deps_auth(dec: ast.AST) -> bool:
+def _decorator_deps_auth(dec: ast.AST, auth_deps_vars: set | frozenset = frozenset()) -> bool:
     if not isinstance(dec, ast.Call):
         return False
     deps = next((k.value for k in dec.keywords if k.arg == "dependencies"), None)
     if deps is None:
         return False
+    # `dependencies=deps` where `deps = [Depends(auth)]` (a variable, not a literal)
+    if isinstance(deps, ast.Name) and deps.id in auth_deps_vars:
+        return True
     for sub in ast.walk(deps):
         if _is_auth_dep_call(sub):
             return True
@@ -691,6 +715,16 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                 if isinstance(t, ast.Name):
                     module_consts.add(t.id)
 
+    # variables holding a dependency list with an auth dep, e.g.
+    # `protected = [Depends(get_current_user)]` used as `dependencies=protected`
+    auth_deps_vars: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.List, ast.Tuple)):
+            if any(_is_auth_dep_call(s) for s in ast.walk(node.value)):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        auth_deps_vars.add(t.id)
+
     def snippet(node) -> str:
         i = node.lineno - 1
         return lines[i].strip() if 0 <= i < len(lines) else ""
@@ -760,7 +794,8 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                     rvar = _decorator_router_var(dec)
                     router_authed = rvar is not None and (module_key, rvar) in protected
                     cbv_authed = enclosing_class(node) in auth_controllers
-                    if not (_handler_has_auth(node, aliases) or _decorator_deps_auth(dec)
+                    if not (_handler_has_auth(node, aliases)
+                            or _decorator_deps_auth(dec, auth_deps_vars)
                             or router_authed or sig_authed or cbv_authed or app_auth_mw
                             or _handler_has_auth_decorator(node)) and not public:
                         sinks.append({"kind": "noauth", "loc": f"{rel}:{node.lineno}",

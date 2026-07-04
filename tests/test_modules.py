@@ -616,6 +616,38 @@ def test_sast_sql_fstring_trusted_interpolation(tmp_path):
     assert "WHERE n" in sqli[0]
 
 
+def test_sast_auth_edge_cases_partial_realias_depsvar(tmp_path):
+    """Adversarial auth patterns: partial(auth_fn), an alias-of-an-alias, and a
+    dependencies=<variable> list — all authenticated; a non-auth deps variable
+    still flags."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "r.py").write_text(
+        "from typing import Annotated\n"
+        "from functools import partial\n"
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "A = Annotated[object, Depends(get_current_user)]\n"
+        "B = A\n"                                         # alias-of-alias
+        "protected = [Depends(get_current_user)]\n"       # auth deps variable
+        "just_db = [Depends(get_db)]\n"                   # NON-auth deps variable
+        "@router.post('/p')\n"
+        "def a(u=Depends(partial(require_role, 'admin'))): ...\n"   # partial(auth)
+        "@router.post('/re')\n"
+        "def b(u: B): ...\n"                              # alias-of-alias annotation
+        "@router.post('/dv', dependencies=protected)\n"
+        "def c(): ...\n"                                  # deps=<auth var>
+        "@router.post('/open', dependencies=just_db)\n"
+        "def d(body): ...\n"                             # deps=<non-auth var> -> flagged
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    noauth = [c for _, c in hits.get("noauth", [])]
+    assert not any(p in c for c in noauth for p in ("/p", "/re", "/dv"))
+    assert any("/open" in c for c in noauth)             # non-auth deps var still flags
+
+
 def test_sast_decorator_auth_login_required(tmp_path):
     """Flask-Login / Starlette-style auth decorators (@login_required,
     @roles_required, @requires) guard a route even with no Depends in the sig."""
