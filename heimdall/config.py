@@ -39,7 +39,7 @@ class TargetConfig:
     mint_scoped: bool = True             # mint API-scoped tokens via a cracked secret
 
     @classmethod
-    def from_dict(cls, d: dict) -> "TargetConfig":
+    def from_dict(cls, d: dict) -> TargetConfig:
         creds = []
         for c in d.get("credentials", []):
             creds.append(Cred(
@@ -70,7 +70,7 @@ class TargetConfig:
         )
 
     @classmethod
-    def load(cls, path: str) -> "TargetConfig":
+    def load(cls, path: str) -> TargetConfig:
         p = Path(path)
         text = p.read_text()
         if p.suffix in (".toml",):

@@ -460,7 +460,7 @@ def _mass_assignment(ctx: Context) -> None:
             ),
             evidence=f"registered {email!r} with extra fields {sorted(injected)} (HTTP "
                      f"{reg.status_code}); response body={reg.text[:200]!r}",
-            reproduction=f"Register with role/is_admin/is_superuser set, then inspect the "
+            reproduction="Register with role/is_admin/is_superuser set, then inspect the "
                          "account's stored privileges directly.",
             references=[REFS["ps-massassign"], REFS["A07"]],
             tools=["Burp (Repeater)", "curl"],

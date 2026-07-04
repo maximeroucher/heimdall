@@ -124,7 +124,7 @@ def test_mass_assignment_skips_nondeterministic_server_fields():
     coincidental match (a boolean is 50/50) can't be attributed to over-binding.
     Deterministic fields are still injected; without a second baseline, the gate
     degrades to the prior single-baseline behaviour."""
-    from heimdall.modules.mass_assignment import _injectable_fields, _MARK_STR, _MARK_NUM
+    from heimdall.modules.mass_assignment import _MARK_NUM, _MARK_STR, _injectable_fields
 
     cands = ["is_admin", "bucket", "role", "created_at", "token_flag", "missing"]
     o0 = {"is_admin": False, "bucket": False, "role": "user", "created_at": 100, "token_flag": True}
@@ -144,8 +144,9 @@ def test_a03_boolean_sqli_needs_reproducible_stable_divergence():
     """Boolean SQLi is confirmed only when TRUE/FALSE diverge reproducibly and
     each side is stable — a non-deterministic body (timestamps, counts, tokens)
     must not be mistaken for an injection."""
-    from heimdall.modules.a03_injection import _confirmed_boolean_sqli
     import itertools
+
+    from heimdall.modules.a03_injection import _confirmed_boolean_sqli
 
     class R:
         def __init__(self, status, text):
@@ -240,6 +241,7 @@ def test_data_exposure_public_metadata_kid_not_a_leak(tmp_path):
     by design, not a data leak; but a PRIVATE JWK component (d/p/q) published in a
     key set IS still flagged."""
     from types import SimpleNamespace
+
     from heimdall.modules import data_exposure as de
 
     r = lambda p: SimpleNamespace(path=p, operation_id="")
@@ -302,6 +304,7 @@ def test_data_exposure_own_token_skipped_cross_user_flagged():
     mistaken for a shared identity."""
     import base64
     import json as _json
+
     from heimdall.modules import data_exposure as de
 
     def jwt(claims):
@@ -375,7 +378,7 @@ def test_decode_jwt_rejects_non_string():
 def test_openapi_versioned_candidates_and_scrape_regex():
     """Versioned openapi paths are candidates, and the docs-scrape regex extracts
     a custom openapi_url from Swagger/ReDoc HTML."""
-    from heimdall.discovery.openapi import OPENAPI_CANDIDATES, _OPENAPI_HREF_RE
+    from heimdall.discovery.openapi import _OPENAPI_HREF_RE, OPENAPI_CANDIDATES
 
     assert "/v1/openapi.json" in OPENAPI_CANDIDATES
     m = _OPENAPI_HREF_RE.search("const ui = SwaggerUIBundle({url: '/v1/openapi.json'})")
@@ -1284,6 +1287,7 @@ def test_sast_callgraph_resolves_sink_to_handler_route(tmp_path):
 
 def test_sast_escalation_tokens_forge_elevated_claims():
     import jwt as pyjwt
+
     from heimdall.core.context import Context
     from heimdall.core.model import AppProfile
     from heimdall.discovery import auth as auth_detect
@@ -1314,6 +1318,7 @@ def test_sast_urlish_param_matching():
 
 def test_sast_canary_records_fetch():
     import urllib.request
+
     from heimdall.modules import sast
 
     with sast._Canary() as c:
