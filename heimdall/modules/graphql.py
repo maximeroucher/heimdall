@@ -28,7 +28,11 @@ from ..core.taxonomy import REFS
 from .base import module
 
 _CANDIDATE_PATHS = ("/graphql", "/graphql/", "/api/graphql", "/v1/graphql",
-                    "/graphql/v1", "/query", "/gql", "/api/gql")
+                    "/graphql/v1", "/query", "/gql", "/api/gql",
+                    # some apps mount the GraphQL ASGI app at root (Ariadne
+                    # `app.mount("/", GraphQL(...))`); tried LAST + confirmed by a
+                    # real GraphQL probe response, so a REST "/" won't false-match
+                    "/")
 
 _PROBE_QUERY = {"query": "{__typename}"}
 _INTROSPECTION = {"query": "query{__schema{queryType{name} types{name}}}"}
