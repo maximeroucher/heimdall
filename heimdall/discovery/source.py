@@ -189,7 +189,13 @@ _DB_ENV_RE = re.compile(
     r"""(?:getenv|environ\.get)\(\s*["']([A-Z][A-Z0-9_]*)["']"""       # os.getenv("X")
     r"""|environ\[\s*["']([A-Z][A-Z0-9_]*)["']\s*\]"""                 # os.environ["X"]
     r"""|(?:^|[^\w.])config\(\s*["']([A-Z][A-Z0-9_]*)["']"""          # decouple config("X")
-    r"""|\benv\s*=\s*["']([A-Z][A-Z0-9_]*)["']""")                    # pydantic Field(env="X")
+    r"""|\benv\s*=\s*["']([A-Z][A-Z0-9_]*)["']"""                     # pydantic Field(env="X")
+    # pydantic-settings / Django-style class field: `POSTGRES_HOST: str = ""`.
+    # BaseSettings reads these from the environment BY FIELD NAME, so the name is
+    # the env var — even though there's no getenv() call to see. Anchored to a
+    # line start (+ indent) so it doesn't match dict keys or annotations mid-expr.
+    r"""|^[ \t]*([A-Z][A-Z0-9_]*)[ \t]*:[ \t]*(?:str|int|bool|float|Optional|[A-Za-z_][\w.]*\[)""",
+    re.MULTILINE)
 
 
 def detect_db_env_vars(source_path: str | None) -> set[str]:
@@ -212,7 +218,8 @@ def detect_db_env_vars(source_path: str | None) -> set[str]:
             except OSError:
                 continue
             for m in _DB_ENV_RE.finditer(txt):
-                name = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+                name = (m.group(1) or m.group(2) or m.group(3) or m.group(4)
+                        or m.group(5))
                 if name and any(k in name for k in kw):
                     out.add(name)
             n += 1

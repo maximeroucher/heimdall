@@ -579,14 +579,35 @@ def test_build_launch_env_never_puts_server_url_in_a_sqlite_var():
     url = "postgresql://heimdall:heimdall@127.0.0.1:54321/heimdall"
     env = _build_launch_env("postgres", "127.0.0.1", 54321, _DOCKER_DB["postgres"],
                             url, "SQLITE_DB", {"POSTGRES_HOST", "POSTGRES_DB"})
-    assert "SQLITE_DB" not in env               # the bug: SQLITE_DB = <postgres url>
-    assert env["DATABASE_URL"] == url           # the URL still reaches the app
-    assert env["POSTGRES_HOST"] == "127.0.0.1"  # discrete coordinates populated
+    assert "SQLITE_DB" not in env                     # the bug: SQLITE_DB = <postgres url>
+    assert env["DATABASE_URL"] == url                 # the URL still reaches the app
+    # No separate PORT var → the throwaway's port is folded into the host, so the
+    # app doesn't fall through to the default 5432 (where the REAL server lives).
+    assert env["POSTGRES_HOST"] == "127.0.0.1:54321"
     assert env["POSTGRES_DB"] == "heimdall"
     # A genuine generic URL var name IS honoured, though:
     env2 = _build_launch_env("postgres", "127.0.0.1", 54321, _DOCKER_DB["postgres"],
                              url, "SQLALCHEMY_DATABASE_URL", set())
     assert env2["SQLALCHEMY_DATABASE_URL"] == url
+
+
+def test_relevant_db_vars_scopes_to_engine_and_drops_noise():
+    """A Postgres throwaway must only rewrite Postgres connection vars — never
+    REDIS_*, a bool like DATABASE_DEBUG, an API key, or a cross-engine SQLITE_DB."""
+    from heimdall.bootstrap.testdb import _build_launch_env, _relevant_db_vars
+    detected = {"POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB",
+                "REDIS_HOST", "REDIS_PORT", "DATABASE_DEBUG", "THE_MOVIE_DB_API",
+                "SQLITE_DB"}
+    keep = _relevant_db_vars(detected, "postgres")
+    assert keep == {"POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"}
+    env = _build_launch_env("postgres", "127.0.0.1", 5001,
+                            {"user": "heimdall", "password": "heimdall", "dbname": "heimdall"},
+                            "postgresql://heimdall:heimdall@127.0.0.1:5001/heimdall",
+                            "SQLITE_DB", keep)
+    # the DEBUG bool / redis / api-key noise is never assigned a DB coordinate
+    assert "DATABASE_DEBUG" not in env and "REDIS_HOST" not in env
+    assert "THE_MOVIE_DB_API" not in env and "SQLITE_DB" not in env
+    assert env["POSTGRES_USER"] == "heimdall" and env["POSTGRES_DB"] == "heimdall"
 
 
 def test_spawn_auto_respects_forced_kind():

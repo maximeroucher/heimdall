@@ -177,15 +177,71 @@ def spawn_docker_db(kind: str, *, source_path: str | None = None,
         raise
     url = spec["url"].format(port=port)
     from ..discovery.source import detect_db_env_vars
-    env_vars = detect_db_env_vars(source_path) if source_path else set()
+    env_vars = _relevant_db_vars(detect_db_env_vars(source_path) if source_path else set(),
+                                 kind)
+    # SAFETY GUARD. A server-DB throwaway is only safe if the app can actually be
+    # pointed AT it. Unlike SQLite (a file path), a Postgres/MySQL app reads its
+    # coordinates from named env vars / config; if we can't detect a single DB var
+    # to override (URL, host, …), the app will fall back to ITS OWN config and
+    # connect to the REAL database — which we'd then attack. Refuse instead, and
+    # tell the user how to proceed safely.
+    url_or_host = any(_var_role(v) in ("url", "host") for v in env_vars)
+    if not url_or_host:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+        raise RuntimeError(
+            f"cannot safely target a throwaway {kind} server: the app exposes no "
+            "DB connection env var (URL/host) to override in its source, so it "
+            "would boot against its REAL database. Use --spawn-db-kind sqlite if "
+            "the app has a SQLite mode, or --db-url to point at a throwaway server "
+            "you control (Heimdall will create an isolated database on it).")
     launch_env = _build_launch_env(kind, "127.0.0.1", port, spec, url, env_var, env_vars)
     return TestDB(kind=kind, path=name, connect_url=url, launch_env=launch_env, container=name)
 
 
+# Which engine-family tokens make a detected env var belong to THIS spawn. A
+# Postgres throwaway must not touch REDIS_* or a MONGO_* var, etc.
+_KIND_TOKENS = {
+    "postgres": ("POSTGRES", "PG", "DATABASE", "SQLALCHEMY", "SQL"),
+    "mysql": ("MYSQL", "MARIADB", "DATABASE", "SQLALCHEMY", "SQL"),
+    "mongo": ("MONGO", "DATABASE"),
+}
+
+
+def _var_role(name: str) -> str | None:
+    """Classify a DB env var by its LAST segment (POSTGRES_HOST → 'host'). The last
+    segment (not a substring) is what disambiguates DATABASE_URL (url) from
+    DATABASE_DEBUG (None) — the latter must never be set to a connection value."""
+    last = name.upper().rsplit("_", 1)[-1]
+    return {
+        "URL": "url", "URI": "url", "DSN": "url",
+        "HOST": "host", "SERVER": "host",
+        "PORT": "port",
+        "USER": "user", "USERNAME": "user",
+        "PASS": "pass", "PASSWORD": "pass",
+        "NAME": "name", "DB": "name", "DATABASE": "name", "DBNAME": "name",
+    }.get(last)
+
+
+def _relevant_db_vars(env_vars: set, kind: str) -> set:
+    """Keep only the detected vars that (a) belong to this engine family and
+    (b) name an actual connection part — dropping REDIS_*/DEBUG/API-key noise and
+    cross-engine (SQLITE_*/MONGO_*) vars that a server spawn must not rewrite."""
+    tokens = _KIND_TOKENS.get(kind, ())
+    keep = set()
+    for v in env_vars:
+        u = v.upper()
+        if "SQLITE" in u or "REDIS" in u:      # never a server-DB coordinate
+            continue
+        if _var_role(v) and any(t in u for t in tokens):
+            keep.add(v)
+    return keep
+
+
 def _build_launch_env(kind: str, host: str, port: int, spec: dict, url: str,
                       env_var: str, env_vars: set) -> dict:
-    """Populate every DB env var the app reads (detected from source) with the
-    throwaway's coordinates, plus the standard URL name(s) as a fallback."""
+    """Populate every DB env var the app reads (already engine-scoped by
+    ``_relevant_db_vars``) with the throwaway's coordinates, plus the standard URL
+    name(s) as a fallback."""
     env: dict = {}
     if kind == "mongo":
         for v in ("MONGO_URL", "MONGODB_URI", "MONGO_URI", "MONGODB_URL"):
@@ -201,20 +257,20 @@ def _build_launch_env(kind: str, host: str, port: int, spec: dict, url: str,
         if env_var and "SQLITE" not in env_var.upper():
             env[env_var] = url
         env["DATABASE_URL"] = url
+    # If the app has no separate PORT var (it interpolates HOST straight into a
+    # connection URL, e.g. `postgresql://u:p@{POSTGRES_HOST}/{DB}`), fold the
+    # throwaway's port INTO the host value — otherwise the app would connect to
+    # the engine's default port (5432/3306), which is where the *real* server
+    # usually lives. When a PORT var does exist we keep host and port separate.
+    has_port_var = any(_var_role(v) == "port" for v in env_vars)
+    host_value = host if has_port_var else f"{host}:{port}"
+    role_value = {"url": url, "host": host_value, "port": str(port),
+                  "user": spec["user"], "pass": spec["password"],
+                  "name": spec["dbname"]}
     for name in env_vars:
-        u = name.upper()
-        if "URL" in u or "URI" in u or "DSN" in u:
-            env[name] = url
-        elif "HOST" in u or "SERVER" in u:
-            env[name] = host
-        elif "PORT" in u:
-            env[name] = str(port)
-        elif "USER" in u:            # USER / USERNAME
-            env[name] = spec["user"]
-        elif "PASS" in u:            # PASS / PASSWORD
-            env[name] = spec["password"]
-        elif "NAME" in u or "DATABASE" in u or u.endswith("_DB") or u == "DB":
-            env[name] = spec["dbname"]
+        role = _var_role(name)
+        if role in role_value:
+            env[name] = role_value[role]
     return env
 
 

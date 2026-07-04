@@ -123,6 +123,15 @@ heimdall --url http://127.0.0.1:8100 --name App --source /path/to/App \
 Point `--launch` at the target's *own* interpreter (e.g. its `.venv/bin/uvicorn`)
 so the boot command resolves the app's dependencies.
 
+Prefer a **server engine** (the app's real backend)? Use `--spawn-db-kind postgres`
+(or `mysql`) instead — Heimdall spins a throwaway Docker server, reads the DB
+connection variables the app actually uses from its source (env vars *and*
+pydantic-settings / Django-style fields), and points the app at the throwaway
+(folding the mapped port into the host when the app has no separate port var). If
+it can't find a single connection variable to override, it **refuses** rather than
+let the app boot against its real database — so a throwaway run never touches
+production data.
+
 ### Library
 
 ```python
