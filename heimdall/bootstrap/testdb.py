@@ -67,7 +67,7 @@ def spawn(launch_cwd: str, *, source_db_url: str | None = None,
 
 def spawn_auto(launch_cwd: str, *, source_path: str | None = None,
                db_url: str | None = None, sqlite_name: str = "heimdall_testdb.sqlite",
-               sqlite_env_var: str = "SQLITE_DB") -> TestDB:
+               sqlite_env_var: str = "SQLITE_DB", force_kind: str | None = None) -> TestDB:
     """Detect the target's DB engine and provide a matching throwaway ON ITS OWN:
 
     * an explicit ``--db-url`` (a reachable server you already run) → a fresh
@@ -80,7 +80,7 @@ def spawn_auto(launch_cwd: str, *, source_path: str | None = None,
     src_url = db_url
     if not src_url and source_path:
         src_url = detect_db_url(source_path)
-    kind = detect_db_kind(source_path, src_url)
+    kind = force_kind or detect_db_kind(source_path, src_url)
     # a caller-supplied server URL means "use this running server"
     if db_url and (kind in ("postgres", "mysql")):
         return spawn_server_db(db_url, kind=kind)
@@ -191,7 +191,15 @@ def _build_launch_env(kind: str, host: str, port: int, spec: dict, url: str,
         for v in ("MONGO_URL", "MONGODB_URI", "MONGO_URI", "MONGODB_URL"):
             env[v] = url
     else:
-        env[env_var or "DATABASE_URL"] = url
+        # `env_var` defaults to the SQLite *filename* variable (SQLITE_DB). A
+        # server-DB connection URL must never be written into a SQLITE_* var — an
+        # app that reads it (e.g. `sqlite:///./{SQLITE_DB}`) would treat the URL as
+        # a filename and fail to boot, or take a SQLite branch the throwaway server
+        # doesn't back. Only honour env_var here when it names a generic URL/DSN
+        # sink; otherwise let DATABASE_URL and the detected discrete vars
+        # (POSTGRES_HOST/USER/PASSWORD/DB, …) carry the coordinates.
+        if env_var and "SQLITE" not in env_var.upper():
+            env[env_var] = url
         env["DATABASE_URL"] = url
     for name in env_vars:
         u = name.upper()

@@ -570,6 +570,67 @@ def test_detect_db_env_vars_and_build_launch_env():
     assert env["MONGO_URL"].endswith("authSource=admin")
 
 
+def test_build_launch_env_never_puts_server_url_in_a_sqlite_var():
+    """A Postgres/MySQL throwaway URL must never be written into a SQLITE_* var:
+    an app that reads it as `sqlite:///./{SQLITE_DB}` would treat the URL as a
+    filename and fail to boot. The URL goes to DATABASE_URL + detected discrete
+    vars instead."""
+    from heimdall.bootstrap.testdb import _DOCKER_DB, _build_launch_env
+    url = "postgresql://heimdall:heimdall@127.0.0.1:54321/heimdall"
+    env = _build_launch_env("postgres", "127.0.0.1", 54321, _DOCKER_DB["postgres"],
+                            url, "SQLITE_DB", {"POSTGRES_HOST", "POSTGRES_DB"})
+    assert "SQLITE_DB" not in env               # the bug: SQLITE_DB = <postgres url>
+    assert env["DATABASE_URL"] == url           # the URL still reaches the app
+    assert env["POSTGRES_HOST"] == "127.0.0.1"  # discrete coordinates populated
+    assert env["POSTGRES_DB"] == "heimdall"
+    # A genuine generic URL var name IS honoured, though:
+    env2 = _build_launch_env("postgres", "127.0.0.1", 54321, _DOCKER_DB["postgres"],
+                             url, "SQLALCHEMY_DATABASE_URL", set())
+    assert env2["SQLALCHEMY_DATABASE_URL"] == url
+
+
+def test_spawn_auto_respects_forced_kind():
+    """--spawn-db-kind sqlite forces the dependency-free SQLite throwaway even when
+    the source tree would auto-detect a server engine (asyncpg/psycopg present)."""
+    import tempfile
+    from pathlib import Path
+
+    from heimdall.bootstrap import testdb
+    with tempfile.TemporaryDirectory() as d:
+        app = Path(d)
+        (app / "requirements.txt").write_text("asyncpg\nsqlalchemy\naiosqlite\n")
+        # auto would pick postgres…
+        assert testdb.spawn_auto.__module__  # sanity: importable
+        tdb = testdb.spawn_auto(str(app), source_path=str(app), force_kind="sqlite")
+        try:
+            assert tdb.kind == "sqlite"
+            assert "SQLITE_DB" in tdb.launch_env
+        finally:
+            tdb.remove()
+
+
+def test_wait_for_server_fails_fast_when_process_exits():
+    """A launched target that dies during boot is detected via proc.poll() so we
+    fail fast instead of polling a dead port until the timeout."""
+    import subprocess
+
+    from heimdall.bootstrap import server
+    proc = subprocess.Popen(["python", "-c", "raise SystemExit(1)"])
+    proc.wait()  # already dead
+    # Would loop the full timeout if it ignored the dead process; must return fast.
+    assert server.wait_for_server("http://127.0.0.1:59999", timeout=30, proc=proc) is False
+
+
+def test_log_tail_reads_last_lines(tmp_path):
+    from heimdall.bootstrap import server
+    p = tmp_path / "t.log"
+    p.write_bytes(b"\n".join(f"line{i}".encode() for i in range(50)))
+    tail = server.log_tail(str(p), lines=5)
+    assert tail.splitlines() == ["line45", "line46", "line47", "line48", "line49"]
+    assert server.log_tail(None) == ""
+    assert server.log_tail(str(tmp_path / "nope.log")) == ""
+
+
 def test_file_upload_static_mount_detection(tmp_path):
     """StaticFiles mount prefixes are detected from source (so a served-back
     upload can be confirmed as stored XSS) plus common conventions."""

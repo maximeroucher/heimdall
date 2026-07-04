@@ -71,8 +71,10 @@ heimdall --list-modules
 | `--name NAME` | Friendly app name for the report. |
 | `--config FILE` | TOML/JSON target config (CLI flags override its fields). |
 | `--cred label:role:identifier:password` | A login credential; repeatable. `role` is free-form (`admin`, `user`, …) and drives BFLA/BOLA pairing. |
-| `--launch CMD` / `--launch-cwd DIR` | Boot the target with a shell command first (and its working dir), then tear it down after. |
+| `--launch CMD` / `--launch-cwd DIR` | Boot the target with a shell command first (and its working dir), then tear it down after. The target's own stdout/stderr is captured to a temp log and, on a failed boot, its tail is printed. |
+| `--launch-timeout SECONDS` | How long to wait for a `--launch` target to answer (default 180). Raise it for apps that run migrations / seed fixtures on first boot. |
 | `--spawn-db` / `--spawn-db-env VAR` | Spin up a throwaway DB matching the target's engine (Docker Postgres/MySQL/Mongo, or a SQLite file) and hand it to the target via `VAR` (default `SQLITE_DB`); torn down after. |
+| `--spawn-db-kind KIND` | Force the throwaway engine (`sqlite`/`postgres`/`mysql`/`mongo`) instead of auto-detecting from the source. `sqlite` is the dependency-free choice for any app with a SQLite mode — no Docker, no port wiring. |
 | `--db-url URL` | An existing throwaway SQLAlchemy URL to provision into (use `postgresql+psycopg2://…`). |
 | `--provision N` / `--provision-admins N` | Insert N low-privilege (and N admin) test users straight into the DB, so BOLA/IDOR/BFLA checks have real cross-tenant subjects even when self-registration is closed. |
 | `--no-mint` | Don't mint API-scoped JWTs even if the signing secret is recovered. |
@@ -104,6 +106,22 @@ model expects) and logs each in through the real login flow, giving the `a01`
 BOLA/IDOR/BFLA probes genuine cross-user subjects. Combined with `--spawn-db` /
 `--launch`, a whole assessment — server, database, users — is created and torn
 down around a single command.
+
+For a **heavier app** that runs migrations and seeds fixtures on boot (and has a
+built-in SQLite mode), force the dependency-free SQLite throwaway and give the
+boot more time — nothing else changes:
+
+```bash
+heimdall --url http://127.0.0.1:8100 --name App --source /path/to/App \
+         --launch '.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8100' \
+         --launch-cwd /path/to/App \
+         --spawn-db --spawn-db-kind sqlite \
+         --provision 3 --provision-admins 1 \
+         --launch-timeout 300
+```
+
+Point `--launch` at the target's *own* interpreter (e.g. its `.venv/bin/uvicorn`)
+so the boot command resolves the app's dependencies.
 
 ### Library
 

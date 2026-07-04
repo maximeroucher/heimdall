@@ -70,7 +70,8 @@ def run(
         # after), a fresh database on a --db-url server, or a SQLite file.
         testdb = testdb_mod.spawn_auto(
             config.launch_cwd, source_path=config.source_path, db_url=config.db_url,
-            sqlite_name=config.spawn_db_name, sqlite_env_var=config.spawn_db_env_var)
+            sqlite_name=config.spawn_db_name, sqlite_env_var=config.spawn_db_env_var,
+            force_kind=config.spawn_db_kind)
         launch_env.update(testdb.launch_env)
         db_url = testdb.connect_url
         detail = (f"docker {testdb.container}" if testdb.container else testdb.path)
@@ -80,12 +81,29 @@ def run(
                             + ", ".join(sorted(testdb.launch_env))))
 
     proc = None
+    target_log = None
     if config.launch:
+        import tempfile
+        fd, target_log = tempfile.mkstemp(prefix="heimdall-target-", suffix=".log")
+        os.close(fd)
         print(term.info(f"launching target: {term.dim(config.launch)}"))
-        proc = server.launch(config.launch, cwd=config.launch_cwd, env=launch_env)
+        print(term.info(f"  target output → {term.dim(target_log)}"))
+        proc = server.launch(config.launch, cwd=config.launch_cwd, env=launch_env,
+                             log_path=target_log)
     try:
-        if not server.wait_for_server(config.base_url, timeout=60):
-            raise SystemExit(term.err(f"target {config.base_url} never became reachable"))
+        wait_timeout = config.launch_timeout if config.launch else 60
+        if not server.wait_for_server(config.base_url, timeout=wait_timeout, proc=proc):
+            exited = proc is not None and proc.poll() is not None
+            why = (f"its process exited early (code {proc.returncode})" if exited
+                   else f"it did not answer within {wait_timeout:.0f}s "
+                        "(raise --launch-timeout if the app migrates/seeds on boot)")
+            tail = server.log_tail(target_log)
+            if tail:
+                print(term.dim("─── last lines of target output ───"))
+                print(term.dim(tail))
+                print(term.dim("───────────────────────────────────"))
+            raise SystemExit(term.err(
+                f"target {config.base_url} never became reachable — {why}"))
 
         print(term.banner(config.name or config.base_url,
                           f"OWASP Top-10 assessment · {config.base_url}"))

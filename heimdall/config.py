@@ -23,12 +23,16 @@ class TargetConfig:
     launch: str | None = None            # shell command to boot the target
     launch_cwd: str | None = None
     launch_env: dict = field(default_factory=dict)
+    launch_timeout: float = 180.0        # seconds to wait for a launched target
+                                         # to answer (migrations + seeding can be slow)
     credentials: list[Cred] = field(default_factory=list)
     authorized: bool = False             # allow a non-loopback target
     make_attacker: bool = True
 
     # -- self-provisioning: spawn a throwaway DB and insert the test data ------
     spawn_db: bool = False               # create a throwaway sqlite DB for the target
+    spawn_db_kind: str | None = None     # force throwaway engine (sqlite/postgres/…);
+                                         # None → auto-detect from the source tree
     spawn_db_env_var: str = "SQLITE_DB"  # env var the target reads (or DATABASE_URL)
     spawn_db_name: str = "heimdall_testdb.sqlite"
     spawn_db_relative: bool = True       # pass bare filename (sqlite:///./{name} apps)
@@ -55,10 +59,12 @@ class TargetConfig:
             launch=d.get("launch"),
             launch_cwd=d.get("launch_cwd"),
             launch_env=d.get("launch_env", {}),
+            launch_timeout=d.get("launch_timeout", 180.0),
             credentials=creds,
             authorized=d.get("authorized", False),
             make_attacker=d.get("make_attacker", True),
             spawn_db=d.get("spawn_db", False),
+            spawn_db_kind=d.get("spawn_db_kind"),
             spawn_db_env_var=d.get("spawn_db_env_var", "SQLITE_DB"),
             spawn_db_name=d.get("spawn_db_name", "heimdall_testdb.sqlite"),
             spawn_db_relative=d.get("spawn_db_relative", True),

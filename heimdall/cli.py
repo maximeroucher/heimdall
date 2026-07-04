@@ -36,10 +36,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="login credential (repeatable)")
     ap.add_argument("--launch", help="shell command to boot the target first")
     ap.add_argument("--launch-cwd", help="cwd for --launch")
+    ap.add_argument("--launch-timeout", type=float, default=None, metavar="SECONDS",
+                    help="how long to wait for a --launch target to answer "
+                         "(default 180; raise it for apps that migrate/seed on boot)")
     ap.add_argument("--spawn-db", action="store_true",
                     help="detect the target's DB engine and spawn a matching throwaway on "
                          "its own — a Docker Postgres/MySQL/Mongo server (torn down after) or "
                          "a SQLite file (needs --launch-cwd; Docker for server engines)")
+    ap.add_argument("--spawn-db-kind", choices=["auto", "sqlite", "postgres", "mysql", "mongo"],
+                    default="auto",
+                    help="force the throwaway DB engine instead of auto-detecting it; "
+                         "'sqlite' is the dependency-free choice for any app with a "
+                         "SQLite mode (no Docker, no port wiring)")
     ap.add_argument("--spawn-db-env", default="SQLITE_DB",
                     help="env var the target reads for the DB (default SQLITE_DB)")
     ap.add_argument("--db-url", help="throwaway DB SQLAlchemy URL to provision into "
@@ -99,12 +107,16 @@ def main(argv: list[str] | None = None) -> int:
             launch=args.launch, launch_cwd=args.launch_cwd,
             credentials=args.cred, make_attacker=not args.no_attacker,
         )
+    if args.launch_timeout is not None:
+        cfg.launch_timeout = args.launch_timeout
     if args.i_have_authorization:
         cfg.authorized = True
     # provisioning flags (CLI overrides config)
     if args.spawn_db:
         cfg.spawn_db = True
         cfg.spawn_db_env_var = args.spawn_db_env
+        if args.spawn_db_kind != "auto":
+            cfg.spawn_db_kind = args.spawn_db_kind
     if args.db_url:
         cfg.db_url = args.db_url
     if args.provision:
