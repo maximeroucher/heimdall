@@ -51,6 +51,27 @@ def _materially_differ(a, b) -> bool:
     if a.status_code != b.status_code:
         return True
     return abs(len(a.text or "") - len(b.text or "")) > _SQLI_BOOL_MIN_DELTA
+
+
+def _confirmed_boolean_sqli(fetch, t_pay, f_pay):
+    """Confirm a boolean-based injection while ruling out non-deterministic
+    endpoints. ``fetch(payload)`` returns a response.
+
+    A naive TRUE-vs-FALSE size diff false-positives on any endpoint whose body
+    varies between *identical* requests (timestamps, CSRF tokens, result counts,
+    rotating content). So we require the divergence to be REPRODUCIBLE and each
+    side to be STABLE: re-request both payloads and confirm same-payload responses
+    don't materially differ while the TRUE/FALSE pair still does. Returns the
+    (true_resp, false_resp) evidence pair, or None."""
+    rt, rf = fetch(t_pay), fetch(f_pay)
+    if not _materially_differ(rt, rf):
+        return None
+    rt2, rf2 = fetch(t_pay), fetch(f_pay)
+    if _materially_differ(rt, rt2) or _materially_differ(rf, rf2):
+        return None                       # jittery endpoint — can't attribute
+    if _materially_differ(rt2, rf2):      # reproducible TRUE≠FALSE divergence
+        return rt2, rf2
+    return None
 # Routes that legitimately reflect user input (search/echo) or are noisy to
 # fuzz; still fuzzed, but this keeps caps meaningful.
 _SQLI_ROUTE_CAP = 40
@@ -123,15 +144,19 @@ def _sqli_sweep(ctx: Context) -> None:
                     break
             if flagged:
                 continue
-            # Boolean-differential: TRUE vs FALSE payloads that differ by one char.
+            # Boolean-differential: TRUE vs FALSE payloads that differ by one char,
+            # confirmed reproducible + stable to rule out non-deterministic bodies.
             for t_pay, f_pay in _SQLI_BOOL_PAIRS:
                 try:
-                    rt = ctx.get(r.fill_path({}), token=token, params={pname: t_pay})
-                    rf = ctx.get(r.fill_path({}), token=token, params={pname: f_pay})
+                    pair = _confirmed_boolean_sqli(
+                        lambda p: ctx.get(r.fill_path({}), token=token,
+                                          params={pname: p}),
+                        t_pay, f_pay)
                 except Exception as exc:
                     ctx.note(f"boolean probe failed for GET {r.path}?{pname}: {exc}")
                     break
-                if _materially_differ(rt, rf):
+                if pair:
+                    rt, rf = pair
                     bool_hits.append((r, pname, t_pay, f_pay, rt, rf))
                     break
 

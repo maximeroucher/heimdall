@@ -38,6 +38,32 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_a03_boolean_sqli_needs_reproducible_stable_divergence():
+    """Boolean SQLi is confirmed only when TRUE/FALSE diverge reproducibly and
+    each side is stable — a non-deterministic body (timestamps, counts, tokens)
+    must not be mistaken for an injection."""
+    from heimdall.modules.a03_injection import _confirmed_boolean_sqli
+    import itertools
+
+    class R:
+        def __init__(self, status, text):
+            self.status_code = status
+            self.text = text
+
+    T, F = 'a" OR "1"="1', 'a" OR "1"="2'
+    # genuine injection: TRUE=all rows (big), FALSE=none (small), stable → flag
+    det = lambda p: R(200, "x" * 2000 if p.rstrip().endswith("1") else "[]")
+    assert _confirmed_boolean_sqli(det, T, F) is not None
+    # status-class divergence, stable → flag
+    st = lambda p: R(200 if p.rstrip().endswith("1") else 500, "ok")
+    assert _confirmed_boolean_sqli(st, "1 OR 1=1", "1 OR 1=2") is not None
+    # reflecting-only (identical bodies) → quiet
+    assert _confirmed_boolean_sqli(lambda p: R(200, "same"), T, F) is None
+    # non-deterministic body length every call → quiet
+    c = itertools.count()
+    assert _confirmed_boolean_sqli(lambda p: R(200, "n" * (100 + next(c) * 137 % 900)), T, F) is None
+
+
 def test_host_header_body_reflection_requires_url_context():
     """A poisoned Host reflected into a body URL (reset link) flags; a debug /
     header-echo endpoint that merely mirrors the request header value as JSON or
