@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import time
 import urllib.request
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .config import ALGO, SECRET_KEY, SEED_USERS
 
@@ -52,7 +53,7 @@ def _db() -> sqlite3.Connection:
 
 # (username, email, plaintext-password, is_admin, ssn, balance)
 _SEED_ROWS = {
-    "admin": ("admin@demo.test", "admin123", 1, "111-11-1111", 1000),
+    "admin": ("admin@demo.test", "admin123", 1, "111-11-1111", 100),
     "alice": ("alice@demo.test", "alice123", 0, "222-22-2222", 100),
     "bob": ("bob@demo.test", "bob123", 0, "333-33-3333", 100),
 }
@@ -75,6 +76,8 @@ def _seed() -> None:
         " password_hash TEXT, is_admin INTEGER DEFAULT 0, ssn TEXT, balance INTEGER DEFAULT 100);"
         "CREATE TABLE IF NOT EXISTS notes ("
         " id INTEGER PRIMARY KEY, owner TEXT, body TEXT);"
+        "CREATE TABLE IF NOT EXISTS redemptions ("
+        " id INTEGER PRIMARY KEY, user_id INTEGER);"
     )
     for username in SEED_USERS:
         _insert_seed_user(conn, username)
@@ -132,10 +135,14 @@ def require_user(token: str | None = Depends(oauth2)) -> sqlite3.Row:
 
 
 class Register(BaseModel):
+    # vuln (mass-assignment): extra="allow" lets the handler trust request-body
+    # fields it never documents — notably `is_admin`, a privileged column not in
+    # this schema, so a self-registering user can grant themselves admin by
+    # over-posting it. `email` is optional (derived from the username if omitted).
+    model_config = ConfigDict(extra="allow")
     username: str
-    email: str
+    email: str | None = None
     password: str
-    is_admin: bool | None = None          # vuln (mass-assignment): client-settable
 
 
 class Login(BaseModel):
@@ -143,20 +150,39 @@ class Login(BaseModel):
     password: str
 
 
-@app.post("/auth/register")
+class UserOut(BaseModel):
+    # The documented response shape. It exposes `is_admin` (a server-controlled
+    # field absent from the Register request schema) so the mass-assignment check
+    # can see it, and still leaks password_hash/ssn for the data-exposure check.
+    id: int
+    username: str
+    email: str | None = None
+    password_hash: str
+    is_admin: bool
+    ssn: str | None = None
+    balance: int | None = None
+
+
+@app.post("/auth/register", response_model=UserOut)
 def register(body: Register):
-    conn = _db()
     # vuln (A07): no password strength check — "1" is accepted.
-    # vuln (mass-assignment): is_admin taken straight from the request body.
+    # vuln (mass-assignment): an undocumented is_admin field is read straight from
+    # the body, so POSTing {"is_admin": true} self-grants admin.
+    extra = body.model_extra or {}
+    email = body.email or f"{body.username}@demo.test"
+    conn = _db()
     try:
         cur = conn.execute(
             "INSERT INTO users (username,email,password_hash,is_admin,ssn)"
             " VALUES (?,?,?,?,?)",
-            (body.username, body.email, _hash(body.password),
-             1 if body.is_admin else 0, "000-00-0000"),
+            (body.username, email, _hash(body.password),
+             1 if extra.get("is_admin") else 0, "000-00-0000"),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
+    except sqlite3.IntegrityError:
+        # vuln (A07): a distinct 'already exists' reveals which usernames are taken.
+        raise HTTPException(status_code=409, detail="username already exists") from None
     finally:
         conn.close()
     # vuln (data-exposure): echoes password_hash, ssn, is_admin back to the client.
@@ -167,6 +193,12 @@ def register(body: Register):
 def login(body: Login):
     conn = _db()
     row = conn.execute("SELECT * FROM users WHERE username=?", (body.username,)).fetchone()
+    # Self-heal seed principals so the assessor can always re-authenticate even
+    # after the delete-BOLA probe removes them (see _current for the rationale).
+    if row is None and body.username in SEED_USERS:
+        _insert_seed_user(conn, body.username)
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE username=?", (body.username,)).fetchone()
     conn.close()
     # vuln (A07): distinct messages leak which usernames exist (enumeration).
     if row is None:
@@ -210,7 +242,12 @@ def get_user(user_id: int, user: sqlite3.Row = Depends(require_user)):
 @app.delete("/users/{user_id}", status_code=204)
 def delete_user(user_id: int, user: sqlite3.Row = Depends(require_user)):
     conn = _db()
-    # vuln (A01 write-BOLA): no ownership/role check on a destructive action.
+    exists = conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone()
+    if not exists:
+        conn.close()
+        raise HTTPException(status_code=404, detail="not found")
+    # vuln (A01 write-BOLA): a real user id is deleted with no ownership/role
+    # check, while a nonexistent id 404s — so the missing authz is observable.
     conn.execute("DELETE FROM users WHERE id=?", (user_id,))
     conn.commit()
     conn.close()
@@ -271,10 +308,14 @@ def go(next: str):
 
 
 @app.post("/auth/forgot-password")
-def forgot(body: Login, request: Request, host: str = Header(default="")):
-    # vuln (host-header): the reset link trusts the Host header for its origin,
-    # so an attacker-controlled Host poisons the link sent to the victim.
-    link = f"https://{host}/reset?user={body.username}&token=abc123"
+def forgot(body: Login, request: Request,
+           x_forwarded_host: str = Header(default=""),
+           host: str = Header(default="")):
+    # vuln (host-header): the reset link trusts the client-supplied host for its
+    # origin — X-Forwarded-Host (the classic, most-abused vector) or the raw Host —
+    # so an attacker poisons the link sent to the victim (password-reset takeover).
+    origin = x_forwarded_host or host
+    link = f"https://{origin}/reset?user={body.username}&token=abc123"
     return {"message": "reset link sent", "reset_link": link}
 
 
@@ -282,17 +323,29 @@ def forgot(body: Login, request: Request, host: str = Header(default="")):
 @app.post("/wallet/redeem")
 def redeem(user: sqlite3.Row = Depends(require_user)):
     conn = _db()
-    # vuln (race/TOCTOU): read-modify-write with no locking or atomic UPDATE, so
-    # concurrent redeems each see the same balance and all succeed (double-spend).
+    # vuln (race/TOCTOU): the balance is checked, then (after a widening window)
+    # written back from the STALE read with no lock or atomic UPDATE. Concurrent
+    # redeems all pass the check against the same balance and all succeed —
+    # double-spend. Each success mints a distinct voucher id, so the divergent
+    # responses expose the cumulative race (vs. an idempotent no-op).
     bal = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()[0]
     if bal < 100:
         conn.close()
         raise HTTPException(status_code=400, detail="insufficient balance")
-    new_bal = bal - 100
-    conn.execute("UPDATE users SET balance=? WHERE id=?", (new_bal, user["id"]))
+    time.sleep(0.03)  # widen the check-to-write window so the race is observable
+    cur = conn.execute("INSERT INTO redemptions (user_id) VALUES (?)", (user["id"],))
+    conn.execute("UPDATE users SET balance=? WHERE id=?", (bal - 100, user["id"]))
     conn.commit()
+    voucher = cur.lastrowid
     conn.close()
-    return {"redeemed": True, "balance": new_bal}
+    return {"redeemed": True, "voucher": voucher}
+
+
+@app.get("/feed")
+def feed(limit: int = 20, user: sqlite3.Row = Depends(require_user)):
+    # vuln (A04 resource-consumption): `limit` has no server-side maximum, so a
+    # client can request an arbitrarily large page and exhaust memory/CPU/bandwidth.
+    return list(range(limit))
 
 
 # ---------------------------------------------------------- intentionally-secure
