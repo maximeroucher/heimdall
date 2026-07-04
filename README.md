@@ -27,7 +27,7 @@ victim's data model. Heimdall doesn't. It **discovers** them:
 | Candidate signing secrets, dependency stack | Optional white-box scan of the source tree (`--source`) |
 
 Modules then operate off that discovered map — so a check written once ("secured
-routes must reject anonymous callers") runs against the app, the app, or your app
+routes must reject anonymous callers") runs against any FastAPI app
 unchanged. Auth-shape detection means the CSRF and session modules light up on a
 cookie-session app and stay quiet on a token API, with no per-app configuration.
 
@@ -202,10 +202,21 @@ only breaks on *new* ones. Upload `findings.sarif` with
 ## Safety & scope
 
 - **Guardrail:** Heimdall refuses any non-loopback target unless you pass
-  `--i-have-authorization`. Only ever test systems you own or are authorized to.
+  `--i-have-authorization`.
 - `--safe` skips every mutating/destructive probe.
 - Reports may contain secrets and target internals — the repo `.gitignore`
   excludes them; keep them out of version control.
+
+### ⚖️ Authorized use only
+
+This is a security-testing tool. **Use it only against systems you own or for
+which you have prior, explicit, written authorization to test.** Unauthorized
+scanning or exploitation of systems you do not own is illegal in most
+jurisdictions (e.g. the US Computer Fraud and Abuse Act, EU Directive 2013/40/EU,
+the UK Computer Misuse Act 1990, and equivalents). By using this software you
+confirm you have the necessary authorization for every target and accept sole
+responsibility for your use of it; the authors accept no liability for misuse.
+See the [LICENSE](LICENSE) for the full disclaimer.
 
 ## How it fits together
 
