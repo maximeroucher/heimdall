@@ -30,10 +30,13 @@ from ..core.context import Context
 from ..core.taxonomy import REFS
 from .base import module
 
-# Markers proving a well-known local file was read back in-band.
-_PASSWD = re.compile(r"root:.*?:0:0:")
+# Markers proving a well-known local file was read back in-band. The passwd
+# matcher is STRUCTURAL — a full account line `name:pw:uid:gid:gecos:home:` —
+# rather than a loose `/bin/bash` / `daemon:` substring, which false-positived on
+# any response echoing a shell path (env dumps, verbose stack traces). It also
+# catches leaks where the visible line isn't root (www-data/daemon only).
+_PASSWD_LINE = re.compile(r"(?m)^[a-z_][a-z0-9_-]*:[^:]*:\d+:\d+:[^:]*:[^:]*:")
 _WININI = re.compile(r"\[(fonts|extensions|mci extensions)\]", re.I)
-_LEAK_HINTS = ("daemon:", "/bin/bash", "/usr/sbin/nologin")
 
 _XML_CTS = ("application/xml", "text/xml", "application/soap+xml",
             "application/xhtml+xml")
@@ -154,13 +157,11 @@ def _leaked(resp) -> str | None:
         body = resp.text or ""
     except Exception:  # pragma: no cover - defensive
         return None
-    if _PASSWD.search(body):
-        m = _PASSWD.search(body)
-        return f"/etc/passwd contents reflected: …{body[m.start():m.start() + 60]}…"
+    m = _PASSWD_LINE.search(body)
+    if m:
+        return f"/etc/passwd account line reflected: …{body[m.start():m.start() + 60]}…"
     if _WININI.search(body):
         return "C:\\windows\\win.ini contents reflected"
-    if any(h in body for h in _LEAK_HINTS):
-        return "local-file markers reflected in response"
     return None
 
 

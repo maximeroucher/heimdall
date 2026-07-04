@@ -38,6 +38,28 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_xxe_leak_detection_is_structural_not_substring():
+    """XXE file-read confirmation must match a structural /etc/passwd account line,
+    not a bare `/bin/bash` / `daemon:` substring that appears in env dumps or
+    stack traces (which produced a false HIGH 'confirmed XXE')."""
+    from heimdall.modules import xxe
+
+    class Resp:
+        def __init__(self, text):
+            self.text = text
+
+    leak = lambda t: xxe._leaked(Resp(t))
+    # real leaks (root present, or only a non-root account) confirm
+    assert leak("root:x:0:0:root:/root:/bin/bash\n") is not None
+    assert leak("www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n") is not None
+    assert leak("[fonts]\r\n[extensions]\r\n") is not None                # win.ini
+    # responses that merely mention a shell path / 'daemon:' but aren't passwd → quiet
+    assert leak('{"env":{"SHELL":"/bin/bash","PATH":"/usr/bin"}}') is None
+    assert leak('Traceback: exec("/bin/bash") in worker daemon: restarting') is None
+    assert leak('<gpx><wpt><name>heimdall</name></wpt></gpx>') is None
+    assert leak('{"created":"12:00:00","uid":0,"gid":0}') is None
+
+
 def test_improper_inventory_config_json_needs_real_secret_value():
     """The config.json probe must require a secret-ish key with a substantive
     value — a public SPA config with null/empty/placeholder values is not a leak,
