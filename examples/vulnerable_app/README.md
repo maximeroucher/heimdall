@@ -26,18 +26,18 @@ heimdall --url http://127.0.0.1:8099 \
 
 Seeded accounts: `admin/admin123`, `alice/alice123`, `bob/bob123`.
 
-A fresh-boot run reports **1 CRITICAL + 11 HIGH** — every planted flaw in the
-table below is detected — plus TESTED-SAFE on the correct endpoints.
+A run reports **1 CRITICAL + 11 HIGH** and detects **every** planted flaw in the
+table below (verified stable across repeated runs), plus TESTED-SAFE on the
+correct endpoints.
 
 > **Pick a free port.** If something already listens on your chosen port, two
 > servers can end up bound to it and requests get split between them — results go
 > haywire. `8099` is used above to avoid the common `8000`.
 >
-> **Run against a fresh boot.** The destructive probes register/delete users and
-> spend balances, so the race-condition finding (a consumable coupon) only fires
-> on the first run against a given boot; restart the app (it reseeds a fresh DB)
-> for a clean baseline. Seed principals self-heal mid-run so the assessor's own
-> accounts survive the delete-BOLA probe.
+> The demo mutates state as it's probed, but detection is stable run-to-run: seed
+> principals self-heal so the assessor's accounts survive the delete-BOLA probe,
+> and the coupon double-spend is exposed by concurrency (not a one-shot balance),
+> so the race finding fires reliably. Restart the app for a pristine DB.
 
 ## What's planted (and which module catches it)
 

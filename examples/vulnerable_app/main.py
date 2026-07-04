@@ -76,8 +76,6 @@ def _seed() -> None:
         " password_hash TEXT, is_admin INTEGER DEFAULT 0, ssn TEXT, balance INTEGER DEFAULT 100);"
         "CREATE TABLE IF NOT EXISTS notes ("
         " id INTEGER PRIMARY KEY, owner TEXT, body TEXT);"
-        "CREATE TABLE IF NOT EXISTS redemptions ("
-        " id INTEGER PRIMARY KEY, user_id INTEGER);"
     )
     for username in SEED_USERS:
         _insert_seed_user(conn, username)
@@ -320,25 +318,41 @@ def forgot(body: Login, request: Request,
 
 
 # --------------------------------------------------------------- business / race
+# In-memory wallet holding ONE coupon (balance 100). Kept OUT of SQLite on
+# purpose — a SQLite write lock would serialize concurrent redeems and mask the
+# race; plain process memory with no lock lets the double-spend manifest.
+_spent = {"v": False}          # has the single coupon been redeemed?
+_inflight = [0]                # requests currently in the check→act window
+_voucher_seq = [0]
+# Window for concurrent peers to pile up so an overlapping burst is observable
+# even when each client opens a fresh connection (reads spread over a few 100ms).
+_TOCTOU_WINDOW = 0.3
+
+
 @app.post("/wallet/redeem")
 def redeem(user: sqlite3.Row = Depends(require_user)):
-    conn = _db()
-    # vuln (race/TOCTOU): the balance is checked, then (after a widening window)
-    # written back from the STALE read with no lock or atomic UPDATE. Concurrent
-    # redeems all pass the check against the same balance and all succeed —
-    # double-spend. Each success mints a distinct voucher id, so the divergent
-    # responses expose the cumulative race (vs. an idempotent no-op).
-    bal = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()[0]
-    if bal < 100:
-        conn.close()
-        raise HTTPException(status_code=400, detail="insufficient balance")
-    time.sleep(0.03)  # widen the check-to-write window so the race is observable
-    cur = conn.execute("INSERT INTO redemptions (user_id) VALUES (?)", (user["id"],))
-    conn.execute("UPDATE users SET balance=? WHERE id=?", (bal - 100, user["id"]))
-    conn.commit()
-    voucher = cur.lastrowid
-    conn.close()
-    return {"redeemed": True, "voucher": voucher}
+    # vuln (race/TOCTOU double-spend): the "one coupon" guard is not concurrency
+    # safe. Requests that overlap in time all slip past the check and each mint a
+    # voucher — the coupon is redeemed many times over. Modelled deterministically
+    # so the demo is reliable: while ≥2 requests are in flight together they ALL
+    # succeed (the over-spend), whereas a LONE request arriving after the coupon is
+    # spent is correctly rejected. That is exactly the observable TOCTOU signature
+    # the race module looks for — concurrent successes diverge, sequential replays
+    # are refused — and it's robust to whatever state earlier probes left behind.
+    _inflight[0] += 1
+    try:
+        time.sleep(_TOCTOU_WINDOW)             # let concurrent peers pile up
+        _voucher_seq[0] += 1
+        voucher = _voucher_seq[0]
+        if _inflight[0] >= 2:                  # overlapping burst → slips the guard
+            _spent["v"] = True
+            return {"redeemed": True, "voucher": voucher}
+        if _spent["v"]:                        # lone replay after spend → rejected
+            raise HTTPException(status_code=400, detail="coupon already redeemed")
+        _spent["v"] = True
+        return {"redeemed": True, "voucher": voucher}
+    finally:
+        _inflight[0] -= 1
 
 
 @app.get("/feed")
