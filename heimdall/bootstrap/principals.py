@@ -70,7 +70,8 @@ def login(http: HttpClient, profile: AppProfile, ident: str, password: str) -> s
             if ap.login_wrapper:
                 body = {ap.login_wrapper: body}   # {"user": {...}} envelope
             r = http.post(ap.login_path, json=body)
-        if r.status_code == 200:
+        # 2xx OR a 3xx redirect (cookie-session logins commonly 302 to a dashboard)
+        if r.status_code < 400:
             try:
                 tok = _extract_token(r.json())
             except ValueError:
@@ -80,29 +81,42 @@ def login(http: HttpClient, profile: AppProfile, ident: str, password: str) -> s
             # Cookie/session auth: no token in the body, but a session cookie was
             # set — carry the cookie value as the principal's credential. Also
             # auto-upgrades apps whose scheme wasn't declared as a cookie scheme.
-            cookie_val = _session_cookie(profile, r)
+            cookie_val = _session_cookie(profile, r, http)
             if cookie_val:
                 return cookie_val
     return None
 
 
-def _session_cookie(profile: AppProfile, resp) -> str | None:
-    jar = resp.cookies
+def _session_cookie(profile: AppProfile, resp, http: HttpClient | None = None) -> str | None:
+    # A login cookie set on a 302 lands in the SESSION JAR after the redirect is
+    # followed (not the final response), so merge the response, its redirect
+    # history, and the persistent jar.
+    jar: dict = {}
+    for c in list(resp.cookies) + [c for h in getattr(resp, "history", []) for c in h.cookies]:
+        jar[c.name] = c.value
+    if http is not None:
+        for c in http.s.cookies:
+            jar.setdefault(c.name, c.value)
     if not jar:
         return None
     named = profile.auth.credential_name
     if named and named in jar:
-        val = jar.get(named)
-    else:
-        # pick the most session-like cookie
-        pref = next((c.name for c in jar if any(
-            k in c.name.lower() for k in ("session", "sess", "sid", "auth", "token"))), None)
-        name = pref or next(iter(jar.keys()))
-        val = jar.get(name)
-        if profile.auth.auth_kind != "cookie":
-            profile.auth.auth_kind = "cookie"
-            profile.auth.credential_name = name
-            profile.notes.append(f"detected cookie-session auth (cookie '{name}')")
+        return jar[named]
+    # pick the most session-like cookie (ignore obvious non-auth cookies)
+    pref = next((n for n in jar if any(
+        k in n.lower() for k in ("session", "sess", "sid", "auth", "token"))
+        and "csrf" not in n.lower() and "xsrf" not in n.lower()), None)
+    name = pref or next(iter(jar))
+    val = jar[name]
+    if profile.auth.auth_kind != "cookie":
+        profile.auth.auth_kind = "cookie"
+        profile.auth.credential_name = name
+        profile.notes.append(f"detected cookie-session auth (cookie '{name}')")
+    # Don't let the login cookie linger in the shared jar — it would silently
+    # authenticate "unauthenticated" probes (false no-auth SAFE / BFLA misses).
+    # It is re-attached explicitly via the Cookie header for authed requests.
+    if http is not None:
+        http.s.cookies.clear()
     return val
 
 
