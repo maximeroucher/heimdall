@@ -38,6 +38,28 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_mass_assignment_skips_nondeterministic_server_fields():
+    """A server-only field that varies between two identical baseline creates
+    (random bucket, cache/timestamp flag) must not be injected into — a
+    coincidental match (a boolean is 50/50) can't be attributed to over-binding.
+    Deterministic fields are still injected; without a second baseline, the gate
+    degrades to the prior single-baseline behaviour."""
+    from heimdall.modules.mass_assignment import _injectable_fields, _MARK_STR, _MARK_NUM
+
+    cands = ["is_admin", "bucket", "role", "created_at", "token_flag", "missing"]
+    o0 = {"is_admin": False, "bucket": False, "role": "user", "created_at": 100, "token_flag": True}
+    o0b = {"is_admin": False, "bucket": True, "role": "user", "created_at": 200, "token_flag": True}
+    inj = _injectable_fields(cands, o0, o0b)
+    assert inj == {"is_admin": True, "role": _MARK_STR, "token_flag": False}
+    assert "bucket" not in inj and "created_at" not in inj      # oscillating + timestamp dropped
+    # present in o0 but absent in the second baseline → non-deterministic → skip
+    assert _injectable_fields(["x"], {"x": False}, {}) == {}
+    # no second baseline → single-baseline fallback (tests everything typable)
+    assert _injectable_fields(cands, o0, None) == {
+        "is_admin": True, "bucket": True, "role": _MARK_STR,
+        "created_at": _MARK_NUM, "token_flag": False}
+
+
 def test_a03_boolean_sqli_needs_reproducible_stable_divergence():
     """Boolean SQLi is confirmed only when TRUE/FALSE diverge reproducibly and
     each side is stable — a non-deterministic body (timestamps, counts, tokens)

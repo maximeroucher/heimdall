@@ -128,22 +128,47 @@ def _distinctive(value):
     return None
 
 
+_MISSING = object()
+
+
+def _injectable_fields(cands, o0, o0b):
+    """Server-only fields worth injecting into: present in the baseline object,
+    distinctively type-settable, and DETERMINISTIC across two identical baseline
+    creates (``o0b`` — may be None if a second baseline wasn't obtained).
+
+    The determinism gate is what keeps this precise: a field that varies between
+    two identical creates (a random A/B bucket, a cache / ``is_new`` flag, a
+    timestamp) could coincidentally match our injected value — for a boolean
+    that's a 50/50 false positive — so we never test it and can only attribute a
+    persisted value to genuine over-binding."""
+    inject = {}
+    for c in cands:
+        if c not in o0:
+            continue
+        if o0b is not None and o0b.get(c, _MISSING) != o0[c]:
+            continue                 # non-deterministic server field — skip
+        d = _distinctive(o0[c])
+        if d is not None and d != o0[c]:
+            inject[c] = d
+    return inject
+
+
 def _probe(ctx, route, cands, token):
-    # Phase 1: baseline create to learn the server-controlled fields' types.
+    # Phase 1: baseline create TWICE — learn the server-controlled fields' types
+    # and confirm each is deterministic (a field that differs between two
+    # identical creates can't be attributed to our injection, see below).
     r0 = _fire(ctx, route, token, {})
     if r0 is None or r0.status_code >= 400:
         return "unreached"
     o0 = _obj(r0)
     if not o0:
         return "unreached"
-    inject = {}
-    for c in cands:
-        if c in o0:
-            d = _distinctive(o0[c])
-            if d is not None and d != o0[c]:
-                inject[c] = d
+    r0b = _fire(ctx, route, token, {})
+    o0b = _obj(r0b) if (r0b is not None and r0b.status_code < 400) else None
+
+    inject = _injectable_fields(cands, o0, o0b)
     if not inject:
-        return "clean"               # server-only fields absent/untypable in output
+        return "clean"               # server-only fields absent/untypable/unstable
 
     # Phase 2: create again, injecting a distinctive value into every such field.
     r1 = _fire(ctx, route, token, inject)
