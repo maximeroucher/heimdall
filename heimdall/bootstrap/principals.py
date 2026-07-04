@@ -125,6 +125,69 @@ def _client(profile: AppProfile) -> HttpClient:
                       credential_name=profile.auth.credential_name)
 
 
+# Authorization value prefixes to try when the detected scheme is rejected. ""
+# means the raw token with no prefix (apiKey-in-Authorization apps).
+_SCHEME_CANDIDATES = ("Bearer", "Token", "JWT", "")
+
+
+def _secured_oracle(http: HttpClient, profile: AppProfile) -> str | None:
+    """A secured GET route that rejects an anonymous request (>=400) — usable to
+    tell whether a token is being accepted, independent of which module asks."""
+    if getattr(profile.auth, "_oracle", "unset") != "unset":
+        return profile.auth._oracle
+    cands = []
+    if profile.auth.me_path:
+        cands.append(profile.auth.me_path)
+    cands += [r.path for r in profile.routes.secured()
+              if r.method == "GET" and not r.has_path_param][:15]
+    found = None
+    for path in cands:
+        try:
+            if http.get(path).status_code >= 400:  # enforces auth when anonymous
+                found = path
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    profile.auth._oracle = found
+    return found
+
+
+def _calibrate_scheme(http: HttpClient, profile: AppProfile, token: str | None) -> None:
+    """Find the Authorization scheme the server actually accepts.
+
+    OpenAPI often declares an ``apiKey``-in-``Authorization`` (or a bare bearer)
+    scheme without pinning the prefix, but the app wants a specific one — e.g. the
+    RealWorld/Conduit convention ``Authorization: Token <jwt>`` (Bearer 403s). If
+    the detected scheme is rejected, replay a known-good token against a secured
+    route with each candidate prefix and lock in the one that works, so every
+    module authenticates correctly."""
+    if not token or getattr(profile.auth, "_scheme_calibrated", False):
+        return
+    oracle = _secured_oracle(http, profile)
+    if not oracle:
+        return
+    if http.get(oracle, token=token).status_code < 400:
+        profile.auth._scheme_calibrated = True  # detected scheme already works
+        return
+    for scheme in _SCHEME_CANDIDATES:
+        raw = f"{scheme} {token}".strip()
+        try:
+            if http.get(oracle, raw_authorization=raw).status_code < 400:
+                if scheme:
+                    profile.auth.auth_kind = "bearer"
+                    profile.auth.header_scheme = scheme
+                else:
+                    profile.auth.auth_kind = "apikey_header"
+                    profile.auth.credential_name = "Authorization"
+                profile.auth._scheme_calibrated = True
+                profile.notes.append(
+                    f"calibrated Authorization scheme to '{scheme or '<raw token>'}' "
+                    "(the detected scheme was rejected by the server)")
+                return
+        except Exception:  # noqa: BLE001
+            continue
+
+
 def bootstrap(profile: AppProfile, creds: list[Cred], *,
               make_attacker: bool = True) -> dict[str, Principal]:
     http = _client(profile)
@@ -138,6 +201,9 @@ def bootstrap(profile: AppProfile, creds: list[Cred], *,
         # API-key apps have no login flow: the supplied secret IS the key.
         if not tok and profile.auth.auth_kind in ("apikey_header", "apikey_query", "basic"):
             tok = c.password
+        if tok:
+            _calibrate_scheme(http, profile, tok)  # lock in the working header scheme
+            http = _client(profile)
         p = Principal(label=c.label, role=c.role, email=c.identifier,
                       username=c.identifier, password=c.password, token=tok, supplied=True)
         if tok:
@@ -256,6 +322,8 @@ def _register_attacker(http: HttpClient, profile: AppProfile) -> Principal | Non
         profile.notes.append("attacker self-registration did not yield a token "
                              "(may need email activation) — cross-tenant tests limited")
         return None
+    _calibrate_scheme(http, profile, tok)   # lock in the working header scheme
+    http = _client(profile)
     p = Principal(label="attacker", role="attacker", email=ident, username=username,
                   password=password, token=tok)
     p.user_id = _whoami(http, profile, tok)
