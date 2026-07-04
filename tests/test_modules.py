@@ -51,6 +51,17 @@ def test_materially_differ_discriminates_boolean_sqli():
     assert a03._materially_differ(R(200, "ok"), R(500, "ok")) is True
 
 
+def _sast_scan(sast, src):
+    """Run the SAST scan over a source dir and return {kind: [(loc, code), ...]}."""
+    graph = {"sinks": [], "handlers": {}, "calls": {}}
+    for p in sast._iter_py(str(src)):
+        sast._scan_file(p, "f.py", open(p).readlines(), graph)
+    out = {}
+    for s in graph["sinks"]:
+        out.setdefault(s["kind"], []).append((s["loc"], s["code"]))
+    return out, graph
+
+
 def test_sast_detects_sinks_and_suppresses_public(tmp_path):
     from heimdall.modules import sast
 
@@ -75,10 +86,7 @@ def test_sast_detects_sinks_and_suppresses_public(tmp_path):
         "    ...\n"
         "# auth=Depends(RolesBasedAuthChecker([ADMIN]))\n"               # commented-out auth
     )
-    hits = {}
-    for p in sast._iter_py(str(src)):
-        lines = open(p).readlines()
-        sast._scan_file(p, "vuln.py", lines, hits)
+    hits, _ = _sast_scan(sast, src)
 
     assert len(hits.get("cmdi", [])) == 1
     assert len(hits.get("ssrf", [])) == 1
@@ -102,9 +110,7 @@ def test_sast_no_false_positive_on_prose_and_literals(tmp_path):
         "    requests.get('https://api.example.com/health')\n"                # constant URL
         "    return 1\n"
     )
-    hits = {}
-    for p in sast._iter_py(str(src)):
-        sast._scan_file(p, "clean.py", open(p).readlines(), hits)
+    hits, _ = _sast_scan(sast, src)
     assert hits == {}
 
 
@@ -120,8 +126,29 @@ def test_sast_decorator_level_auth_suppresses_noauth(tmp_path):
         "def update(article):\n"
         "    ...\n"
     )
-    hits = {}
-    for f in sast._iter_py(str(src)):
-        sast._scan_file(f, "r.py", open(f).readlines(), hits)
+    hits, _ = _sast_scan(sast, src)
     # auth declared at the decorator level -> NOT a missing-auth finding
     assert "noauth" not in hits
+
+
+def test_sast_callgraph_resolves_sink_to_handler_route(tmp_path):
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    # sink lives in a util; the route handler reaches it 1 hop away
+    (src / "a.py").write_text(
+        "import subprocess\n"
+        "def run_df(p):\n"
+        "    return subprocess.run('df -h ' + p, shell=True)\n"          # cmdi sink in util
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "@router.get('/admin/disk')\n"
+        "def disk(parameters, user=Depends(get_current_user)):\n"
+        "    return run_df(parameters)\n"                                 # handler calls the util
+    )
+    _hits, graph = _sast_scan(sast, src)
+    cmdi = [s for s in graph["sinks"] if s["kind"] == "cmdi"]
+    assert len(cmdi) == 1
+    routes = sast._routes_for_sink(cmdi[0], graph["handlers"], graph["calls"])
+    assert ("get", "/admin/disk") in routes         # resolved util sink -> its handler route
