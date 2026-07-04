@@ -63,7 +63,10 @@ _PS_SSTI = "https://portswigger.net/web-security/server-side-template-injection"
 # (`[_-]auth\b` and `\bauth\b` need a word boundary, which "author"/"authors"
 # lack — the char after "auth" there is a word char).
 _AUTH_NAME_RE = re.compile(
-    r"current[_-]?user|current[_-]?active|get[_-]?current|roles?[_-]?based|role[_-]?checker|"
+    # `current_user` and role-qualified variants (fastapi-users style:
+    # current_admin_user, current_curator_or_admin_user, current_limited_user)
+    r"current[a-z0-9_]*user|active[_-]?user|admin[_-]?user|current[_-]?active|"
+    r"get[_-]?current|roles?[_-]?based|role[_-]?checker|"
     r"require[_-]|has[_-]?permission|has[_-]?role|api[_-]?key|apikey|oauth2?[_-]?scheme|"
     r"verify[_-]?(token|jwt|auth|api|key|session)|authenticat|"
     r"auth[_-]?(required|guard|user|dep|dependency|scheme|token|check|middleware|backend|context)|"
@@ -84,7 +87,7 @@ _PUBLIC_ROUTE = re.compile(
     r"password|passwd|reset.?password|forgot|recover|password.?recovery|verif|"
     r"validate[_-]?(email|account)|activate|confirm|resend|magic[_-]?link|otp|"
     r"onboarding|invitation|\binvite\b|accept[_-]?invite|"
-    r"webhook|callback|oauth|/health|/docs|openapi|\.well-known",
+    r"webhook|callback|oauth|\bsso\b|saml|/health|/docs|openapi|\.well-known",
     re.IGNORECASE)
 _CAP_TOKEN_PARAM = re.compile(r"\{[^}]*(token|code|secret|magic|invite|api[_-]?key)[^}]*\}",
                               re.IGNORECASE)

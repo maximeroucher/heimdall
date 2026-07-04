@@ -433,6 +433,21 @@ def test_sast_skips_migration_dirs(tmp_path):
     assert scanned == []                 # whole revisions subtree skipped
 
 
+def test_sast_auth_ish_recognizes_fastapi_users_and_rejects_false_friends():
+    """Real-world auth dependency names — including fastapi-users' role-qualified
+    current_<role>_user — are recognized; CRUD/lookup names are not."""
+    from heimdall.modules import sast
+
+    for name in ("current_user", "current_active_user", "current_admin_user",
+                 "current_curator_or_admin_user", "current_limited_user",
+                 "current_chat_accessible_user", "require_permission", "verify_jwt",
+                 "user_api_key_auth", "get_admin_user", "authorize"):
+        assert sast._auth_ish(name), name
+    for name in ("get_author", "authors_list", "create_user", "delete_user",
+                 "get_user_by_id", "update_user", "list_users", "get_book"):
+        assert not sast._auth_ish(name), name
+
+
 def test_sast_auth_router_subclass_and_cbv_controller(tmp_path):
     """Mealie-style auth: an APIRouter SUBCLASS that bakes the auth dep into its
     constructor, and a class-based-view controller whose base class carries the
