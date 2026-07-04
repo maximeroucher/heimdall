@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ app }} — Heimdall report</title>
+<style>
+:root{
+  --bg:#f6f6f7; --panel:#ffffff; --ink:#18181b; --muted:#71717a;
+  --line:#e4e4e7; --line2:#f0f0f2; --chip:#f4f4f5;
+  --accent:#b91c1c; --accent-soft:#fef2f2; --accent-line:#fecaca;
+  --hero1:#1c1917; --hero2:#292524;
+  --code-bg:#1c1917; --code-ink:#e7e5e4; --code-line:#3f3f46;
+  --crit:#7f1d1d; --high:#c2410c; --med:#a16207; --low:#1d4ed8; --info:#52525b; --safe:#15803d;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0c0a09; --panel:#171513; --ink:#f4f4f5; --muted:#a1a1aa;
+    --line:#292524; --line2:#211e1c; --chip:#211e1c;
+    --accent:#f87171; --accent-soft:#1f1413; --accent-line:#5b2321;
+    --hero1:#0a0908; --hero2:#1c1917;
+    --code-bg:#0a0908; --code-ink:#e7e5e4; --code-line:#292524;
+    --crit:#b91c1c; --high:#ea580c; --med:#ca8a04; --low:#3b82f6; --info:#71717a; --safe:#16a34a;
+  }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:1040px;margin:0 auto;padding:0 1.25rem 5rem}
+.hero{background:linear-gradient(135deg,var(--hero1),var(--hero2));color:#fafaf9;
+  border-bottom:3px solid var(--accent);padding:2.4rem 0 2rem;margin-bottom:1.6rem}
+.hero .wrap{padding-bottom:0}
+.hero .eyebrow{font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+  color:#fca5a5;font-weight:700;display:flex;align-items:center;gap:.5rem}
+.hero h1{margin:.4rem 0 .85rem;font-size:2.05rem;font-weight:800;letter-spacing:-.02em}
+.hero .metaline{display:flex;flex-wrap:wrap;gap:.5rem}
+.pill{background:rgba(250,250,249,.08);border:1px solid rgba(250,250,249,.16);
+  padding:.28rem .7rem;border-radius:8px;font-size:12.5px;font-weight:600;
+  display:inline-flex;gap:.35rem;align-items:center;color:#e7e5e4}
+.pill code{background:rgba(0,0,0,.35);color:#fca5a5;padding:0 .3rem;border-radius:4px}
+.disclaimer{font-size:13px;color:var(--muted);margin:.2rem 0 1.6rem;
+  border-left:3px solid var(--accent-line);padding-left:.8rem}
+h2{font-size:1.3rem;font-weight:800;letter-spacing:-.01em;margin:2.4rem 0 .9rem;
+  padding-bottom:.45rem;border-bottom:1px solid var(--line);position:relative}
+h2::after{content:"";position:absolute;left:0;bottom:-1px;width:44px;height:3px;
+  background:var(--accent);border-radius:2px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.7rem;margin:1rem 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:.85rem 1rem;
+  cursor:pointer;transition:.15s;position:relative;overflow:hidden;user-select:none}
+.card:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(0,0,0,.09)}
+.card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--c)}
+.card .n{font-size:2rem;font-weight:800;line-height:1;color:var(--c)}
+.card .l{font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;font-weight:700;
+  color:var(--muted);margin-top:.35rem}
+.card.active{outline:2px solid var(--c);outline-offset:-1px}
+.card.static{cursor:default}
+.card.static:hover{transform:none;box-shadow:none}
+.distbar{display:flex;height:12px;border-radius:999px;overflow:hidden;margin:.4rem 0 .2rem;
+  background:var(--line2);border:1px solid var(--line)}
+.distbar span{display:block}
+.hint{font-size:12px;color:var(--muted);margin:.3rem 0 0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+table{border-collapse:collapse;width:100%}
+th,td{padding:.6rem .85rem;text-align:left;font-size:13.5px;border-bottom:1px solid var(--line2)}
+th{background:var(--chip);font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;
+  color:var(--muted);font-weight:700}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--chip)}
+.badge{display:inline-block;color:#fff;padding:.12rem .55rem;border-radius:6px;
+  font-size:11px;font-weight:800;letter-spacing:.03em;vertical-align:middle}
+.sev-CRITICAL{background:var(--crit)} .sev-HIGH{background:var(--high)}
+.sev-MEDIUM{background:var(--med)} .sev-LOW{background:var(--low)}
+.sev-INFO{background:var(--info)} .sev-SAFE{background:var(--safe)}
+.owasp-tag{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;font-weight:700;
+  background:var(--chip);border:1px solid var(--line);padding:.05rem .4rem;border-radius:5px}
+.chain{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--high);
+  border-radius:12px;padding:1rem 1.2rem;margin:.9rem 0}
+.chain h4{margin:0 0 .5rem;font-size:1.02rem;display:flex;align-items:center;gap:.5rem}
+.chain ol{margin:.4rem 0;padding-left:1.2rem}
+.chain li{margin:.2rem 0}
+.finding{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:1.1rem 1.3rem;margin:1rem 0;border-left:5px solid var(--c);scroll-margin-top:1rem}
+.finding h3{margin:.1rem 0 .55rem;font-size:1.12rem;font-weight:800;display:flex;
+  gap:.55rem;align-items:baseline;flex-wrap:wrap}
+.finding h3 .num{color:var(--muted);font-weight:700}
+.metarow{display:flex;flex-wrap:wrap;gap:.4rem;margin:.2rem 0 .7rem;align-items:center}
+.tag{font-size:11.5px;color:var(--muted);background:var(--chip);border:1px solid var(--line);
+  padding:.1rem .5rem;border-radius:6px}
+.tag code{background:none;padding:0;color:var(--ink);font-weight:600}
+.summary{margin:.3rem 0 .8rem}
+.blk{margin:.8rem 0}
+.blk .lbl{font-size:11px;letter-spacing:.07em;text-transform:uppercase;font-weight:700;
+  color:var(--muted);margin-bottom:.3rem;display:flex;justify-content:space-between;align-items:center}
+pre{background:var(--code-bg);color:var(--code-ink);padding:.85rem 1rem;overflow:auto;
+  border-radius:9px;border:1px solid var(--code-line);
+  font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0}
+code{background:var(--chip);padding:1px 5px;border-radius:4px;
+  font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace}
+.copy{background:none;border:1px solid var(--line);color:var(--muted);font-size:10.5px;
+  padding:.1rem .45rem;border-radius:5px;cursor:pointer;letter-spacing:.04em;font-weight:700}
+.copy:hover{color:var(--accent);border-color:var(--accent)}
+.reflink{font-size:12.5px}
+.refs{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.4rem}
+.footer{text-align:center;color:var(--muted);font-size:12.5px;margin-top:3rem;
+  padding-top:1.4rem;border-top:1px solid var(--line)}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+
+<header class="hero"><div class="wrap">
+  <div class="eyebrow">🛡️ Heimdall · Web Application Penetration Test</div>
+  <h1>{{ app }}</h1>
+  <div class="metaline">
+    <span class="pill">🎯 <code>{{ base_url }}</code></span>
+    <span class="pill">📅 {{ date }}</span>
+    <span class="pill">⚙️ {{ framework }}</span>
+    <span class="pill">{{ "🟢" if safe else "🔴" }} {{ "SAFE · non-destructive" if safe else "FULL · active exploitation" }}</span>
+    <span class="pill">🗺️ {{ route_count }} routes</span>
+    {% if principal_count %}<span class="pill">👤 {{ principal_count }} principals</span>{% endif %}
+  </div>
+</div></header>
+
+<div class="wrap">
+
+<p class="disclaimer">Automated assessment generated by Heimdall. Run only against systems you own
+or are explicitly authorized to test. CVSS values are indicative severity bands, not per-finding
+computed vectors.</p>
+
+<h2>Executive summary</h2>
+<p class="hint">{{ total_real }} finding{{ "" if total_real == 1 else "s" }} requiring attention{% if safe_n %}, plus {{ safe_n }} tested-safe control{{ "" if safe_n == 1 else "s" }}{% endif %}. Click a card to filter.</p>
+<div class="cards">
+  {% for s in sev_order %}
+  <div class="card" data-sev="{{ s }}" style="--c:{{ colors[s] }}" onclick="sevFilter('{{ s }}')">
+    <div class="n">{{ counts[s] }}</div><div class="l">{{ s }}</div>
+  </div>
+  {% endfor %}
+  <div class="card static" style="--c:{{ colors['SAFE'] }}">
+    <div class="n">{{ safe_n }}</div><div class="l">Tested-safe</div>
+  </div>
+</div>
+{% if total_real %}
+<div class="distbar">
+  {% for seg in dist %}<span title="{{ seg.sev }}: {{ seg.n }}" style="width:{{ seg.pct }}%;background:{{ seg.color }}"></span>{% endfor %}
+</div>
+{% endif %}
+
+{% if chains %}
+<h2>⛓️ Attack chains</h2>
+<p class="hint">How individual findings compose into end-to-end attacks (highest impact first).</p>
+{% for c in chains %}
+<div class="chain" style="border-left-color:{{ c.color }}">
+  <h4><span class="badge sev-{{ c.severity }}">{{ c.severity }}</span> {{ loop.index }}. {{ c.title }}</h4>
+  <ol>{% for step in c.steps %}<li>{{ step }}</li>{% endfor %}</ol>
+  {% if c.finding_ids %}<p class="hint">Chained: {% for fid in c.finding_ids %}<code>{{ fid }}</code>{{ ", " if not loop.last }}{% endfor %}</p>{% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
+<h2>Findings at a glance</h2>
+<div class="panel"><table>
+  <thead><tr><th>#</th><th>Severity</th><th>CVSS</th><th>OWASP</th><th>Finding</th></tr></thead>
+  <tbody>
+  {% for f in findings %}
+    <tr data-sev="{{ f.severity }}">
+      <td>{{ f.i }}</td>
+      <td><span class="badge sev-{{ f.severity }}">{{ f.severity }}</span></td>
+      <td>{{ f.cvss }}</td>
+      <td><span class="owasp-tag">{{ f.owasp }}</span></td>
+      <td><a href="#f{{ f.i }}">{{ f.title }}</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+
+<h2>Detailed findings</h2>
+{% for f in findings %}
+<section class="finding" id="f{{ f.i }}" data-sev="{{ f.severity }}" style="--c:{{ f.color }}">
+  <h3><span class="num">{{ f.i }}.</span> <span class="badge sev-{{ f.severity }}">{{ f.severity }}</span> {{ f.title }}</h3>
+  <div class="metarow">
+    <span class="owasp-tag">{{ f.owasp }}</span>
+    <span class="tag">{{ f.owasp_full }}</span>
+    <span class="tag"><code>{{ f.id }}</code></span>
+    {% if f.module %}<span class="tag">module <code>{{ f.module }}</code></span>{% endif %}
+    {% if f.severity != "SAFE" %}<span class="tag">CVSS {{ f.cvss }}</span>{% endif %}
+    {% if f.route %}<span class="tag">route <code>{{ f.route }}</code></span>{% endif %}
+    {% if f.location %}<span class="tag">src <code>{{ f.location }}</code></span>{% endif %}
+  </div>
+  <div class="summary">{{ f.summary }}</div>
+  {% for b in f.blocks %}
+  <div class="blk">
+    <div class="lbl">{{ b.lbl }}<button class="copy" onclick="copyPre(this)">COPY</button></div>
+    <pre>{{ b.val }}</pre>
+  </div>
+  {% endfor %}
+  {% if f.references %}
+  <div class="blk"><div class="lbl">References</div><div class="refs">
+    {% for r in f.references %}<a class="reflink" href="{{ r }}">{{ r }}</a>{% endfor %}
+  </div></div>
+  {% endif %}
+  {% if f.tools %}
+  <div class="blk"><div class="lbl">Tools</div>
+    {% for t in f.tools %}<code>{{ t }}</code> {% endfor %}
+  </div>
+  {% endif %}
+</section>
+{% endfor %}
+
+{% if notes %}
+<h2>Run notes</h2>
+<div class="panel"><table><tbody>
+  {% for n in notes %}<tr><td>{{ n }}</td></tr>{% endfor %}
+</tbody></table></div>
+{% endif %}
+
+<div class="footer">Generated by 🛡️ <b>Heimdall</b> · self-discovering OWASP Top-10 assessment for FastAPI</div>
+
+</div>
+
+<script>
+function sevFilter(sev){
+  var cards=document.querySelectorAll('.card[data-sev]');
+  var active=document.querySelector('.card[data-sev].active');
+  var isSame=active&&active.dataset.sev===sev;
+  cards.forEach(function(c){c.classList.remove('active')});
+  var findings=document.querySelectorAll('.finding');
+  var rows=document.querySelectorAll('tr[data-sev]');
+  if(isSame){
+    findings.forEach(function(f){f.classList.remove('hidden')});
+    rows.forEach(function(r){r.classList.remove('hidden')});
+    return;
+  }
+  document.querySelector('.card[data-sev="'+sev+'"]').classList.add('active');
+  findings.forEach(function(f){f.classList.toggle('hidden',f.dataset.sev!==sev)});
+  rows.forEach(function(r){r.classList.toggle('hidden',r.dataset.sev!==sev)});
+}
+function copyPre(btn){
+  var pre=btn.closest('.blk').querySelector('pre');
+  navigator.clipboard.writeText(pre.innerText).then(function(){
+    var t=btn.textContent;btn.textContent='COPIED';setTimeout(function(){btn.textContent=t},1200);
+  });
+}
+</script>
+</body>
+</html>

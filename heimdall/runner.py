@@ -10,6 +10,7 @@ from datetime import datetime
 
 from .bootstrap import server
 from .config import TargetConfig
+from .core import term
 from .core.context import Context
 from .core.findings import write_reports
 from .core.guardrail import assert_target_allowed
@@ -75,24 +76,26 @@ def run(
             sqlite_name=config.spawn_db_name, sqlite_env_var=config.spawn_db_env_var)
         launch_env.update(testdb.launch_env)
         db_url = testdb.connect_url
-        print(f"[*] spawned throwaway {testdb.kind} DB: {testdb.path}")
+        print(term.info(f"spawned throwaway {term.bold(testdb.kind)} DB: {testdb.path}"))
         if testdb.kind != "sqlite":
-            print(f"[*] target will launch with DATABASE_URL -> …/{testdb.path}")
+            print(term.info(f"target will launch with DATABASE_URL → …/{testdb.path}"))
 
     proc = None
     if config.launch:
-        print(f"[*] launching target: {config.launch}")
+        print(term.info(f"launching target: {term.dim(config.launch)}"))
         proc = server.launch(config.launch, cwd=config.launch_cwd, env=launch_env)
     try:
         if not server.wait_for_server(config.base_url, timeout=60):
-            raise SystemExit(f"[!] target {config.base_url} never became reachable")
+            raise SystemExit(term.err(f"target {config.base_url} never became reachable"))
 
-        print("[*] discovering application surface…")
+        print(term.banner(config.name or config.base_url,
+                          f"OWASP Top-10 assessment · {config.base_url}"))
+        print(term.info("discovering application surface…"))
         profile = discovery.discover(
             config.base_url, source_path=config.source_path, app_name=config.name)
         print(summarize(profile))
 
-        print("\n[*] bootstrapping principals…")
+        print("\n" + term.info(term.bold("bootstrapping principals…")))
         principals = bootstrap_principals(
             profile, config.credentials, make_attacker=config.make_attacker)
 
@@ -103,7 +106,7 @@ def run(
             _mint_scoped_tokens(profile, principals)
 
         authed = [k for k, p in principals.items() if p.authed]
-        print(f"[*] authenticated principals: {authed or 'none'}")
+        print(term.ok(f"authenticated principals: {term.bold(', '.join(authed) or 'none')}"))
 
         ctx = Context(profile, safe=safe, verbose=verbose)
 
@@ -111,22 +114,22 @@ def run(
         from .modules.base import ordered
         specs = ordered()
 
-        print(f"\n[*] running {len(specs)} module(s) "
-              f"({'SAFE' if safe else 'FULL'} mode)\n")
+        mode = term.sev("SAFE", "SAFE") if safe else term.sev("FULL", "CRITICAL")
+        print("\n" + term.info(term.bold(f"running {len(specs)} module(s) ")) + f"({mode} mode)\n")
         for spec in specs:
             if only and spec.key not in only:
                 continue
             if skip and spec.key in skip:
                 continue
             if spec.destructive and safe:
-                print(f"[-] {spec.key}: {spec.name} (skipped — destructive, safe mode)")
+                print(term.skip(f"{spec.key}: {spec.name} (skipped — destructive, safe mode)"))
                 continue
-            print(f"[+] {spec.key}: {spec.name}")
+            print(term.ok(f"{term.bold(spec.key)}  {term.dim(spec.name)}"))
             ctx._current_module = spec.key
             try:
                 spec.fn(ctx)
             except Exception:  # noqa: BLE001 — a crashing module must not abort the run
-                print(f"[!] module {spec.key} crashed:")
+                print(term.err(f"module {spec.key} crashed:"))
                 traceback.print_exc()
                 ctx.note(f"module {spec.key} crashed mid-run (partial results)")
 
@@ -180,10 +183,10 @@ def _provision(config, profile, principals: dict, db_url: str | None) -> None:
         password=config.provision_password,
         db_url=db_url,
     )
-    print(f"[*] self-provisioning {req.low_priv} low-priv + {req.admins} admin user(s)…")
+    print(term.info(f"self-provisioning {req.low_priv} low-priv + {req.admins} admin user(s)…"))
     res = provision(profile, req)
     for n in res.notes:
-        print(f"      · {n}")
+        print("    " + term.dim("· " + n))
     for p in res.principals:
         principals[p.label] = p
 
@@ -215,5 +218,5 @@ def _mint_scoped_tokens(profile, principals: dict) -> None:
             p.extra["minted_scopes"] = scopes
             n += 1
     if n:
-        print(f"[*] signing secret recovered → minted {scopes!r}-scoped tokens "
-              f"for {n} principal(s)")
+        print(term.warn(f"signing secret recovered → minted {scopes!r}-scoped tokens "
+                        f"for {n} principal(s)"))

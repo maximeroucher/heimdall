@@ -86,3 +86,30 @@ def test_write_reports_emits_all_artifacts(tmp_path):
     assert "9.8" in md and "Attack chains" in md          # CVSS + chains rendered
     sarif = json.load(open(os.path.join(tmp_path, "findings.sarif")))
     assert sarif["runs"][0]["results"]
+
+
+def test_html_report_structure_and_summary(tmp_path):
+    write_reports(_fs(), str(tmp_path),
+                  {"app_name": "Demo", "base_url": "http://127.0.0.1", "date": "d",
+                   "route_count": 12, "principals": ["admin", "user"]})
+    html = open(os.path.join(tmp_path, "REPORT.html")).read()
+    assert html.lstrip().startswith("<!doctype html>")
+    assert "Demo" in html and "http://127.0.0.1" in html
+    # interactive severity filter + copy handlers shipped
+    assert "sevFilter" in html and "copyPre" in html
+    # executive-summary cards + at-a-glance anchors
+    assert 'data-sev="CRITICAL"' in html and 'href="#f1"' in html
+    # attack-chains section rendered from the same findings
+    assert "Attack chains" in html
+
+
+def test_html_report_autoescapes_findings(tmp_path):
+    # a finding carrying markup must not break the page or inject script
+    evil = Finding("a03-xss", "A03", "Stored <script>alert(1)</script>", "HIGH",
+                   "Payload persisted: <img src=x onerror=alert(1)>")
+    write_reports([evil], str(tmp_path),
+                  {"app_name": "Demo", "base_url": "http://127.0.0.1", "date": "d"})
+    html = open(os.path.join(tmp_path, "REPORT.html")).read()
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert "onerror=alert(1)&gt;" in html

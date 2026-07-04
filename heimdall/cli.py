@@ -7,6 +7,7 @@ import sys
 
 from .bootstrap.principals import Cred
 from .config import TargetConfig
+from .core import term
 from .discovery import discover, summarize
 from .modules.base import REGISTRY
 from .runner import run
@@ -64,14 +65,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--list-modules", action="store_true", help="list modules and exit")
     ap.add_argument("--i-have-authorization", action="store_true",
                     help="permit a non-loopback target (authorized use only)")
+    ap.add_argument("--no-color", action="store_true",
+                    help="disable ANSI colour in terminal output")
     args = ap.parse_args(argv)
+
+    if args.no_color:
+        term.set_enabled(False)
 
     if args.list_modules:
         # import to populate the registry
         from .runner import _import_all_modules
         _import_all_modules()
+        print(term.banner("modules", "registered OWASP detectors"))
         for spec in sorted(REGISTRY.values(), key=lambda m: m.key):
-            print(f"  {spec.key:8} {spec.name}")
+            print(f"  {term.accent(f'{spec.key:9}')} {spec.name}")
         return 0
 
     if args.config:
@@ -109,14 +116,16 @@ def main(argv: list[str] | None = None) -> int:
         from .core.guardrail import assert_target_allowed
         assert_target_allowed(cfg.base_url, cfg.authorized)
         profile = discover(cfg.base_url, source_path=cfg.source_path, app_name=cfg.name)
+        print(term.banner(profile.app_name or cfg.base_url, "discovery only"))
         print(summarize(profile))
         if profile.secrets:
-            print("\nCandidate secrets:")
+            print("\n" + term.accent("Candidate secrets:"))
             for s in profile.secrets:
-                print(f"  [{s.kind}] {s.name} = {s.value!r}  ({s.source})")
-        print("\nNotes:")
+                print(f"  {term.dim('['+s.kind+']')} {term.bold(s.name)} = "
+                      f"{s.value!r}  {term.dim('('+s.source+')')}")
+        print("\n" + term.accent("Notes:"))
         for n in profile.notes:
-            print(f"  · {n}")
+            print("  " + term.dim("· " + n))
         return 0
 
     only = {s.strip() for s in args.only.split(",") if s.strip()}
@@ -129,20 +138,31 @@ def main(argv: list[str] | None = None) -> int:
     known = _load_baseline(args.baseline) if args.baseline else set()
     gate = [f for f in result.issues if not known or f.id not in known]
 
-    print("\n" + "=" * 60)
-    print(f"[=] {len(result.findings)} findings — "
-          + ", ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    print("\n" + term.rule(58))
+    print("  " + term.accent(f"RESULTS  {len(result.findings)} findings"))
+    # severity tally as coloured chips, high→low
+    sev_line = "   ".join(
+        term.sev(f"● {s} {counts[s]}", s)
+        for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "SAFE")
+        if counts.get(s))
+    if sev_line:
+        print("  " + sev_line)
     if known:
-        print(f"[=] baseline: {len(result.issues) - len(gate)} known, {len(gate)} new")
-    for f in sorted(gate, key=lambda x: x.severity):
-        tag = "" if not known else " (NEW)"
-        print(f"    {f.severity:9} {f.owasp}  {f.title}{tag}")
-    print(f"\n[=] Report:  {result.report_paths[1]}")
+        print("  " + term.dim(f"baseline: {len(result.issues) - len(gate)} known, "
+                              f"{len(gate)} new"))
+    print(term.rule(58))
+    for f in sorted(gate, key=lambda x: _SEV_RANK.get(x.severity.upper(), 9)):
+        tag = term.dim(" (NEW)") if known else ""
+        print(f"  {term.sev(f'{f.severity:<8}', f.severity)} "
+              f"{term.dim(f.owasp)}  {f.title}{tag}")
+
+    print()
+    print("  " + term.accent("Report") + f"  {result.report_paths[1]}")
     if len(result.report_paths) > 2:
-        print(f"[=] HTML:    {result.report_paths[2]}")
+        print("  " + term.accent("HTML  ") + f"  {result.report_paths[2]}")
     if len(result.report_paths) > 3:
-        print(f"[=] SARIF:   {result.report_paths[3]}")
-    print(f"[=] JSON:    {result.report_paths[0]}")
+        print("  " + term.accent("SARIF ") + f"  {result.report_paths[3]}")
+    print("  " + term.accent("JSON  ") + f"  {result.report_paths[0]}")
 
     # CI gate: exit non-zero if any (new, if baseline) finding is at/above --fail-on.
     order = ["info", "low", "medium", "high", "critical"]
@@ -152,8 +172,12 @@ def main(argv: list[str] | None = None) -> int:
     bad = [f for f in gate if f.severity.lower() in order
            and order.index(f.severity.lower()) >= threshold]
     if bad:
-        print(f"\n[!] {len(bad)} finding(s) at/above '{args.fail_on}' — failing (exit 1)")
+        print("\n" + term.err(f"{len(bad)} finding(s) at/above "
+                              f"'{args.fail_on}' — failing (exit 1)"))
     return 1 if bad else 0
+
+
+_SEV_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "SAFE": 5}
 
 
 def _load_baseline(path: str) -> set:
