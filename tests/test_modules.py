@@ -38,6 +38,19 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_data_exposure_token_expected_on_auth_route():
+    """A token/JWT returned by a token-issuing auth route (login/refresh) is
+    expected, not a leak; the same token on a normal route IS a leak, and a
+    leaked password fires even on an auth route."""
+    from heimdall.modules import data_exposure as de
+
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.abc123def456ghi789xyz"
+    assert de._sensitive("access_token", jwt, True, set()) is None      # auth route
+    assert de._sensitive("access_token", jwt, False, set()) is not None  # normal route
+    # a plaintext password is never expected, even on an auth route
+    assert de._sensitive("access_token", "Summer2024!", True, {"Summer2024!"}) is not None
+
+
 def test_looks_like_id_param():
     assert looks_like_id_param("user_id")
     assert looks_like_id_param("id")

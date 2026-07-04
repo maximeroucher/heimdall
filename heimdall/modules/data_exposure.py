@@ -241,6 +241,12 @@ _META_FIELDS = frozenset({
     "placeholder", "example", "examples", "sample", "hint", "default", "pattern",
     "format", "mask", "template", "demo", "eg", "e_g", "prefix_example",
 })
+# token-bearing field names — a token in the response of a token-ISSUING auth
+# route (login/refresh/token) is the whole point, not a leak
+_TOKEN_FIELDS = frozenset({
+    "access_token", "refresh_token", "token", "id_token", "jwt", "bearer",
+    "api_key", "apikey", "auth_token", "session_token",
+})
 
 
 def _sensitive(key: str, value, auth_route: bool, known_pw: set):
@@ -254,8 +260,14 @@ def _sensitive(key: str, value, auth_route: bool, known_pw: set):
     sval = str(value)
     # 1) the VALUE itself is sensitive by format/checksum — behavioural, name-blind
     #    (credentials, provider keys, card numbers, IBANs, SSNs). HIGH confidence.
+    # a token-issuing auth route (login/refresh/token) returns tokens BY DESIGN —
+    # its JWT/token value (or token-named field) is expected, not a leak. Other
+    # sensitive values (passwords, cards, PII) below still flag even here.
+    token_expected = auth_route and (kl in _TOKEN_FIELDS or "token" in kl)
     vleak = _value_leak(sval)
     if vleak:
+        if token_expected and ("jwt" in vleak.lower() or "token" in vleak.lower()):
+            return None
         return f"value is a {vleak}", "HIGH"
     # 2) the VALUE equals a password we know is a password — a credential the scan
     #    authenticated with, or a complex common one. Definitive plaintext leak,
@@ -264,6 +276,8 @@ def _sensitive(key: str, value, auth_route: bool, known_pw: set):
         return "value is a plaintext password (matches a known/used credential)", "HIGH"
     # 3) a high-entropy token/key with no known format — behavioural, name-blind.
     if _entropy_secret(sval):
+        if token_expected:           # a token on a token-issuing route is expected
+            return None
         return "value is a high-entropy secret-like string (probable token/key)", "MEDIUM"
     # 4) field NAME denotes a secret — last-resort fallback for a plaintext value
     #    we neither recognise as a format nor know as a credential.
