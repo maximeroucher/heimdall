@@ -156,6 +156,24 @@ def test_public_by_design():
     assert not a01._is_public_by_design("/users/", "list_users")
 
 
+def test_a02_token_in_query_runs_without_authentication():
+    """A credential in a query string is visible from the route map alone — the
+    check must fire even when Heimdall could not authenticate (no principal)."""
+    from heimdall.core.context import Context
+    from heimdall.core.model import AppProfile
+    from heimdall.discovery import openapi as oa
+    from heimdall.modules import a02_crypto_jwt as a02
+
+    spec = {"openapi": "3.1.0", "info": {"title": "T"}, "paths": {
+        "/authorize": {"get": {"operationId": "authz", "parameters": [
+            {"name": "token", "in": "query", "required": True,
+             "schema": {"type": "string"}}]}}}}
+    rm = oa.parse_routes(spec)
+    ctx = Context(AppProfile(base_url="http://x", routes=rm))   # NO authed principal
+    a02._token_in_query(ctx)
+    assert any(f.id == "a02-token-in-query" for f in ctx.findings())
+
+
 def test_materially_differ_discriminates_boolean_sqli():
     from heimdall.modules import a03_injection as a03
 

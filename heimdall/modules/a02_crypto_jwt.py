@@ -136,6 +136,11 @@ def _signatures_unverified(ctx: Context, header: dict, claims: dict,
 
 @module("a02", "Cryptographic Failures / JWT forging")
 def run(ctx: Context) -> None:
+    # Static route check — a credential in a query string is visible from the
+    # route map alone, so run it BEFORE any "no authenticated token" early-exit
+    # (an app we can't log into can still expose ?token= in its surface).
+    _token_in_query(ctx)
+
     principal = ctx.profile.any_authed()
     if not principal or not principal.token:
         ctx.note("no authenticated token available; JWT checks skipped")
@@ -156,7 +161,6 @@ def run(ctx: Context) -> None:
 
     # Offline / oracle-free checks first (proof is cryptographic, not a server 200).
     _weak_secret(ctx, header, claims, token)
-    _token_in_query(ctx)
 
     # Everything below concludes "forgery accepted" from a live 2xx, which is only
     # meaningful against a route that actually enforces auth. If no such oracle
