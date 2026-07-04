@@ -381,9 +381,13 @@ def _resolve_protected_routers(parsed: list, top_pkg: str) -> set:
                             protected.add((module_key, t.id))
             elif isinstance(node, ast.Call) and _callee(node).split(".")[-1] == "include_router":
                 pv = node.func.value if isinstance(node.func, ast.Attribute) else None
-                if not isinstance(pv, ast.Name) or not node.args:
+                if not isinstance(pv, ast.Name):
                     continue
-                child_sym = _sym(node.args[0])
+                # child router can be positional OR the `router=` keyword arg
+                child_arg = node.args[0] if node.args else _kwarg(node, "router")
+                if child_arg is None:
+                    continue
+                child_sym = _sym(child_arg)
                 if child_sym is None:
                     continue
                 edges.append(((module_key, pv.id), child_sym,
@@ -505,7 +509,13 @@ def _route_decorator(dec: ast.AST):
     verb = dec.func.attr.lower()
     if verb not in ("get", "head", "post", "put", "patch", "delete"):
         return None
-    path = dec.args[0].value if (dec.args and isinstance(dec.args[0], ast.Constant)) else "?"
+    path = "?"
+    if dec.args and isinstance(dec.args[0], ast.Constant):
+        path = dec.args[0].value
+    else:                                    # `@router.patch(path="/{id}", ...)`
+        pk = _kwarg(dec, "path")
+        if isinstance(pk, ast.Constant):
+            path = pk.value
     return verb, path
 
 

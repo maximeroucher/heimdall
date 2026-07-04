@@ -553,6 +553,31 @@ def test_sast_sql_fstring_trusted_interpolation(tmp_path):
     assert "WHERE n" in sqli[0]
 
 
+def test_sast_keyword_path_and_router_include(tmp_path):
+    """`@router.delete(path="/{id}")` and `include_router(router=child,
+    dependencies=[Depends(auth)])` use keyword args — the path must be read and
+    the keyword-child auth must propagate."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "r.py").write_text(
+        "from fastapi import APIRouter, Depends\n"
+        "child = APIRouter()\n"
+        "@child.delete(path='/{id}')\n"
+        "def remove(id): ...\n"                       # authed via keyword-child include
+        "pub = APIRouter()\n"
+        "@pub.delete(path='/{id}')\n"
+        "def remove_pub(id): ...\n"                   # not protected -> flagged
+        "parent = APIRouter()\n"
+        "parent.include_router(router=child, dependencies=[Depends(current_user)])\n"
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    codes = [c for _, c in hits.get("noauth", [])]
+    assert any("remove_pub" in c and "/{id}" in c for c in codes)   # keyword path read
+    assert not any("(remove)" in c for c in codes)                  # keyword-child auth
+
+
 def test_sast_public_auth_account_routes_suppressed(tmp_path):
     """Auth/account-lifecycle endpoints (login/token/session, registration,
     password flows) are unauthenticated by design — not missing-auth findings."""
