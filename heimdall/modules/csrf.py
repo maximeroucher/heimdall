@@ -25,6 +25,38 @@ _SAMESITE_RE = re.compile(r"samesite\s*=\s*(lax|strict|none)", re.I)
 _SECURE_RE = re.compile(r"\bsecure\b", re.I)
 _EVIL_ORIGIN = "https://evil.example.com"
 
+# Split a (possibly multi-cookie) Set-Cookie header into individual cookies. A
+# new cookie starts with `name=`; the lookahead avoids splitting on the comma
+# inside an `Expires=Wed, 21 Oct ...` date (no `=` follows that comma).
+_COOKIE_SPLIT_RE = re.compile(r",(?=\s*[^\s=;,]+=)")
+
+
+def _session_samesite(setcookie: str):
+    """SameSite of the most-likely SESSION/auth cookie in a Set-Cookie header.
+
+    A login often sets several cookies (e.g. a non-HttpOnly ``csrftoken`` AND the
+    HttpOnly ``sessionid``); reading the first SameSite in header order reads the
+    wrong cookie. We score each cookie — HttpOnly and a session-ish name score up,
+    a csrf/xsrf token cookie scores down — and read the winner's SameSite so the
+    CSRF verdict reflects the cookie that actually carries auth. Returns
+    ``(samesite_lower_or_None, cookie_name)``."""
+    cookies = _COOKIE_SPLIT_RE.split(setcookie) or [setcookie]
+
+    def score(c: str) -> int:
+        name = c.strip().split("=", 1)[0].strip().lower()
+        s = 0
+        if re.search(r"httponly", c, re.I):
+            s += 2
+        if any(h in name for h in ("session", "sess", "sid", "auth")):
+            s += 3
+        if any(h in name for h in ("csrf", "xsrf")):
+            s -= 3            # anti-CSRF token cookie is not the auth cookie
+        return s
+
+    best = max(cookies, key=score)
+    m = _SAMESITE_RE.search(best)
+    return (m.group(1).lower() if m else None), best.strip().split("=", 1)[0].strip()
+
 
 @module("csrf", "Cross-Site Request Forgery")
 def run(ctx: Context) -> None:
@@ -44,8 +76,7 @@ def run(ctx: Context) -> None:
     setcookie = _login_setcookie(ctx)
     samesite = None
     if setcookie:
-        m = _SAMESITE_RE.search(setcookie)
-        samesite = m.group(1).lower() if m else None
+        samesite, _ = _session_samesite(setcookie)
     samesite_protected = samesite in ("lax", "strict")
 
     # Does the server accept state-changing requests without a CSRF token / from

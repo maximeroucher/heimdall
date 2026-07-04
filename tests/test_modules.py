@@ -38,6 +38,26 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_csrf_reads_samesite_of_the_session_cookie():
+    """When a login sets several cookies, the CSRF verdict must reflect the SameSite
+    of the auth cookie, not whichever SameSite appears first in the header."""
+    from heimdall.modules.csrf import _session_samesite
+
+    # csrftoken=Lax listed first, but the HttpOnly session cookie is None → none
+    got, name = _session_samesite(
+        "csrftoken=abc; SameSite=Lax, sessionid=xyz; SameSite=None; HttpOnly")
+    assert got == "none" and name == "sessionid"
+    # a None analytics cookie first, session cookie is Lax → lax
+    got, _ = _session_samesite("other=1; SameSite=None, sessionid=xyz; SameSite=Lax; HttpOnly")
+    assert got == "lax"
+    # the comma inside an Expires date must not split the cookie
+    got, _ = _session_samesite(
+        "sessionid=x; Expires=Wed, 21 Oct 2025 07:28:00 GMT; SameSite=Lax; HttpOnly")
+    assert got == "lax"
+    # single strict session cookie
+    assert _session_samesite("session=x; SameSite=Strict; HttpOnly")[0] == "strict"
+
+
 def test_mass_assignment_skips_nondeterministic_server_fields():
     """A server-only field that varies between two identical baseline creates
     (random bucket, cache/timestamp flag) must not be injected into — a
