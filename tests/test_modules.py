@@ -9,7 +9,7 @@ def test_all_modules_register():
     from heimdall.runner import _import_all_modules
     _import_all_modules()
     keys = {m.key for m in ordered()}
-    for expected in ("a01", "a02", "a03", "a05", "a06", "a07", "a10", "csrf", "race", "session"):
+    for expected in ("a01", "a02", "a03", "a05", "a06", "a07", "a10", "csrf", "race", "session", "sast"):
         assert expected in keys, expected
     assert REGISTRY["race"].destructive is True
     assert REGISTRY["a01"].destructive is False
@@ -49,3 +49,60 @@ def test_materially_differ_discriminates_boolean_sqli():
     assert a03._materially_differ(R(200, "x" * 9000), R(200, "x" * 12)) is True
     # a status-class change is also material
     assert a03._materially_differ(R(200, "ok"), R(500, "ok")) is True
+
+
+def test_sast_detects_sinks_and_suppresses_public(tmp_path):
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    (src / "svc").mkdir(parents=True)
+    (src / "svc" / "vuln.py").write_text(
+        "import subprocess, requests\n"
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "def run_cmd(p):\n"
+        "    return subprocess.run('df -h ' + p, shell=True)\n"          # cmdi
+        "def fetch(url):\n"
+        "    return requests.get(url)\n"                                  # ssrf
+        "@router.delete('/widgets/{id}')\n"
+        "def delete_widget(id):\n"                                        # noauth (state-change, no Depends)
+        "    ...\n"
+        "@router.post('/register')\n"
+        "def register(body):\n"                                          # public -> suppressed
+        "    ...\n"
+        "@router.delete('/items/{id}')\n"
+        "def delete_item(id, user=Depends(get_current_user)):\n"          # has auth -> not flagged
+        "    ...\n"
+        "# auth=Depends(RolesBasedAuthChecker([ADMIN]))\n"               # commented-out auth
+    )
+    hits = {}
+    for p in sast._iter_py(str(src)):
+        lines = open(p).readlines()
+        sast._scan_file(p, "vuln.py", lines, hits)
+
+    assert len(hits.get("cmdi", [])) == 1
+    assert len(hits.get("ssrf", [])) == 1
+    assert len(hits.get("commented_auth", [])) == 1
+    noauth_paths = [c for _, c in hits.get("noauth", [])]
+    assert any("/widgets/{id}" in c for c in noauth_paths)          # flagged
+    assert not any("/register" in c for c in noauth_paths)          # public -> suppressed
+    assert not any("/items/{id}" in c for c in noauth_paths)        # has Depends -> not flagged
+
+
+def test_sast_no_false_positive_on_prose_and_literals(tmp_path):
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "clean.py").write_text(
+        "import subprocess, requests\n"
+        "# This function uses Depends(...) for authentication, see docs.\n"   # prose, not a sink
+        "def ok():\n"
+        "    subprocess.run(['ls', '-l'])\n"                                   # list form, no shell
+        "    requests.get('https://api.example.com/health')\n"                # constant URL
+        "    return 1\n"
+    )
+    hits = {}
+    for p in sast._iter_py(str(src)):
+        sast._scan_file(p, "clean.py", open(p).readlines(), hits)
+    assert hits == {}
