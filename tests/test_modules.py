@@ -106,3 +106,22 @@ def test_sast_no_false_positive_on_prose_and_literals(tmp_path):
     for p in sast._iter_py(str(src)):
         sast._scan_file(p, "clean.py", open(p).readlines(), hits)
     assert hits == {}
+
+
+def test_sast_decorator_level_auth_suppresses_noauth(tmp_path):
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "r.py").write_text(
+        "from fastapi import APIRouter, Depends\n"
+        "router = APIRouter()\n"
+        "@router.put('/{slug}', dependencies=[Depends(check_article_modification_permissions)])\n"
+        "def update(article):\n"
+        "    ...\n"
+    )
+    hits = {}
+    for f in sast._iter_py(str(src)):
+        sast._scan_file(f, "r.py", open(f).readlines(), hits)
+    # auth declared at the decorator level -> NOT a missing-auth finding
+    assert "noauth" not in hits

@@ -134,6 +134,26 @@ def _handler_has_auth(fn: ast.AST) -> bool:
     return False
 
 
+def _decorator_deps_auth(dec: ast.AST) -> bool:
+    """FastAPI routes can declare auth at the decorator level:
+    ``@router.put(..., dependencies=[Depends(check_permissions)])``. Inspect that
+    ``dependencies=`` list for an auth Depends (missing this false-positived
+    c{api}tal's guarded PUT /{slug})."""
+    if not isinstance(dec, ast.Call):
+        return False
+    deps = next((k.value for k in dec.keywords if k.arg == "dependencies"), None)
+    if deps is None:
+        return False
+    for sub in ast.walk(deps):
+        if isinstance(sub, ast.Call) and _callee(sub).split(".")[-1] == "Depends" and sub.args:
+            d = sub.args[0]
+            name = d.id if isinstance(d, ast.Name) else (
+                _callee(d) if isinstance(d, ast.Call) else getattr(d, "attr", ""))
+            if _auth_ish(name):
+                return True
+    return False
+
+
 def _route_decorator(dec: ast.AST):
     """(method, path) if this decorator is @<x>.<verb>('/path'), else None."""
     if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):
@@ -227,7 +247,8 @@ def _scan_file(path: str, rel: str, lines: list[str], hits: dict) -> None:
                 if route and route[0] in ("post", "put", "patch", "delete"):
                     public = (_PUBLIC_ROUTE.search(route[1]) or _PUBLIC_ROUTE.search(node.name)
                               or _CAP_TOKEN_PARAM.search(route[1]))
-                    if not _handler_has_auth(node) and not public:
+                    has_auth = _handler_has_auth(node) or _decorator_deps_auth(dec)
+                    if not has_auth and not public:
                         hits.setdefault("noauth", []).append(
                             (f"{rel}:{node.lineno}", f"{route[0].upper()} {route[1]}  ({node.name})"))
                     break
