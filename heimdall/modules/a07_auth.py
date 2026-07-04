@@ -97,6 +97,18 @@ def _brute_force(ctx: Context) -> None:
         return
 
     if tripped_at is None:
+        # Only report "no login rate limit" if the endpoint actually EVALUATED
+        # credentials. A login rejecting a bogus password returns 200/400/401/403;
+        # an all-422/404/405 response means the request never became a login
+        # attempt (the endpoint isn't a credential-processing login, or discovery
+        # mis-identified it) — reporting a missing throttle would be a false
+        # positive (e.g. a CRUD-only app with no auth at all).
+        _cred_processed = {200, 400, 401, 403}
+        if not any(c in _cred_processed for c in codes):
+            ctx.note(f"login probe at {ctx.auth.login_path} returned "
+                     f"{sorted(set(codes))} — no credential evaluation (not a usable "
+                     "login endpoint); brute-force/rate-limit check skipped")
+            return
         ctx.finding(
             id="a07-login-rate-limit",
             owasp="A07", severity="MEDIUM",

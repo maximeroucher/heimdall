@@ -345,6 +345,33 @@ def test_sast_skips_migration_dirs(tmp_path):
     assert scanned == []                 # whole revisions subtree skipped
 
 
+def test_a07_skips_rate_limit_when_no_credential_evaluation(monkeypatch):
+    """All-422 responses mean the endpoint never processed a login (or discovery
+    mis-identified a CRUD route as login) — don't report a missing throttle."""
+    from heimdall.core.context import Context
+    from heimdall.core.model import AppProfile
+    from heimdall.modules import a07_auth as a07
+
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+    ctx = Context(AppProfile(base_url="http://x"))
+    ctx.auth.login_path = "/books"
+
+    # not a login: every attempt is a schema 422, credentials never evaluated
+    monkeypatch.setattr(a07, "_login_attempt", lambda *a, **k: _Resp(422))
+    a07._brute_force(ctx)
+    assert not any(f.id == "a07-login-rate-limit" for f in ctx.findings())
+
+    # a real login rejecting bogus creds (401) with no 429 -> finding fires
+    ctx2 = Context(AppProfile(base_url="http://x"))
+    ctx2.auth.login_path = "/auth/login"
+    monkeypatch.setattr(a07, "_login_attempt", lambda *a, **k: _Resp(401))
+    a07._brute_force(ctx2)
+    assert any(f.id == "a07-login-rate-limit" for f in ctx2.findings())
+
+
 def test_race_excludes_delete_from_candidates():
     """DELETE is not a race target: its 'sequential repeat rejected' signal is
     trivially true (resource gone) and duplicate-delete has no double-spend."""
