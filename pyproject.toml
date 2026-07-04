@@ -60,3 +60,7 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately use throwaway lambdas and `assert False` for unreachable branches.
+"tests/**" = ["E731", "B011"]

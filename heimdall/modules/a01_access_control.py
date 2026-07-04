@@ -29,7 +29,7 @@ _PUBLIC_OK = ("login", "register", "token", "openapi", "docs", "health",
 _PUBLIC_EXACT = frozenset({
     "/", "/routes", "/test", "/ping", "/pong", "/healthz", "/livez", "/readyz",
     "/health/liveliness", "/health/readiness", "/metrics", "/version", "/status",
-    "/favicon.ico", "/robots.txt", "/openapi.json", "/docs", "/redoc", "/",
+    "/favicon.ico", "/robots.txt", "/openapi.json", "/docs", "/redoc",
 })
 
 
@@ -214,13 +214,10 @@ def _idor(ctx: Context) -> None:
         if own:
             probes.append(own)
         probes += ["1", "2", "00000000-0000-0000-0000-000000000001"]
-        got_own = False
         cross = None
         for val in probes:
             resp = ctx.get(r.fill_path({pname: val}), token=attacker.token)
-            if val == own and resp.status_code < 300:
-                got_own = True
-            elif val != own and resp.status_code < 300 and len(resp.content) > 2:
+            if val != own and resp.status_code < 300 and len(resp.content) > 2:
                 cross = (val, resp)
         if cross is not None:
             hits.append((r, cross))

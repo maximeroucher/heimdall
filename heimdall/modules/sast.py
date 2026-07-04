@@ -398,7 +398,7 @@ def _resolve_protected_routers(parsed: list, top_pkg: str) -> set:
                 for a in node.names:
                     alias_map[a.asname or a.name] = (tgt, a.name)
 
-        def _sym(child):
+        def _sym(child, alias_map=alias_map, module_key=module_key):
             # `router` (Name) -> local or imported symbol; `mod.router` (Attr) ->
             # symbol in the imported submodule.
             if isinstance(child, ast.Name):

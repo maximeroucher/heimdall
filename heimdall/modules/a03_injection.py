@@ -149,8 +149,8 @@ def _sqli_sweep(ctx: Context) -> None:
             for t_pay, f_pay in _SQLI_BOOL_PAIRS:
                 try:
                     pair = _confirmed_boolean_sqli(
-                        lambda p: ctx.get(r.fill_path({}), token=token,
-                                          params={pname: p}),
+                        lambda p, r=r, pname=pname: ctx.get(r.fill_path({}), token=token,
+                                                            params={pname: p}),
                         t_pay, f_pay)
                 except Exception as exc:
                     ctx.note(f"boolean probe failed for GET {r.path}?{pname}: {exc}")
@@ -550,6 +550,7 @@ _TRAVERSAL_PAYLOADS = [
     "../../../../../../../../etc/hostname",
 ]
 import re as _re  # noqa: E402
+
 _PASSWD_RE = _re.compile(r"root:.*?:0:0:")
 
 

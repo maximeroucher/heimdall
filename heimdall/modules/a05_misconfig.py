@@ -226,10 +226,8 @@ def _security_headers(ctx: Context) -> None:
     """One consolidated finding listing absent browser-hardening headers."""
     https = ctx.base_url.lower().startswith("https")
     targets = ["/"]
-    json_path = None
     for p in ("/openapi.json", ctx.auth.me_path, ctx.auth.login_path):
         if p and p not in targets:
-            json_path = p
             targets.append(p)
             break
 
