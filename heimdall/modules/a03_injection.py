@@ -26,6 +26,31 @@ from .base import body_says_error, module
 _SQLI_PROBES = ["'", "' OR '1'='1", "1;SELECT pg_sleep(0)--", "%27", "\" OR \"1\"=\"1"]
 # A value that should never itself trigger a server error — the baseline.
 _BENIGN = "heimdallbaseline1"
+
+# Boolean-differential SQLi pairs: each (TRUE, FALSE) differs only in the final
+# digit (1 vs 2), so a reflecting endpoint returns near-identical bodies while a
+# genuine injection diverges (TRUE matches all rows, FALSE none). This catches
+# data-returning injections that leak no SQL error and no 500 — notably SQLite
+# (which has no sleep primitive, so the time-based module can't confirm) and apps
+# that mask errors behind a generic 500/200. Covers double/single-quote and
+# numeric contexts.
+_SQLI_BOOL_PAIRS = [
+    ('heim" OR "1"="1', 'heim" OR "1"="2'),
+    ("heim' OR '1'='1", "heim' OR '1'='2"),
+    ("heim' OR 1=1-- -", "heim' OR 1=2-- -"),
+    ("1 OR 1=1", "1 OR 1=2"),
+]
+# Response bodies differing by more than one reflected char (or a status change)
+# are attributable to the boolean condition, not to reflection length.
+_SQLI_BOOL_MIN_DELTA = 48
+
+
+def _materially_differ(a, b) -> bool:
+    """True when two responses diverge beyond a one-char payload reflection —
+    the signal that a boolean SQL condition changed the result set."""
+    if a.status_code != b.status_code:
+        return True
+    return abs(len(a.text or "") - len(b.text or "")) > _SQLI_BOOL_MIN_DELTA
 # Routes that legitimately reflect user input (search/echo) or are noisy to
 # fuzz; still fuzzed, but this keeps caps meaningful.
 _SQLI_ROUTE_CAP = 40
@@ -33,6 +58,8 @@ _SQLI_PARAM_CAP = 3
 _XSS_ROUTE_CAP = 25
 # NoSQL operator-injection hint: routes that look like auth or filtering.
 _OPINJ_HINT = ("login", "token", "auth", "signin", "search", "filter", "query", "find")
+# Candidate filter keys for a schemaless body whose fields aren't documented.
+_NOSQL_KEYS = ("username", "email", "user", "name", "id", "login", "q", "query", "search")
 
 
 @module("a03", "Injection (SQLi / XSS / SSTI / traversal)")
@@ -64,6 +91,7 @@ def _sqli_sweep(ctx: Context) -> None:
 
     error_hits = []   # strong: SQL error signature leaked
     err500_hits = []  # weak: payload caused a 500 the baseline did not
+    bool_hits = []    # strong: boolean-differential (data-returning) injection
     tested = 0
     for r in targets:
         for param in r.query_params[:_SQLI_PARAM_CAP]:
@@ -78,6 +106,7 @@ def _sqli_sweep(ctx: Context) -> None:
                 continue
             base_500 = base.status_code >= 500
             tested += 1
+            flagged = False
             for probe in _SQLI_PROBES:
                 try:
                     resp = ctx.get(r.fill_path({}), token=token, params={pname: probe})
@@ -86,10 +115,55 @@ def _sqli_sweep(ctx: Context) -> None:
                     continue
                 if body_says_error(resp.text):
                     error_hits.append((r, pname, probe, resp))
+                    flagged = True
                     break  # one strong signal per param is enough
                 if resp.status_code >= 500 and not base_500:
                     err500_hits.append((r, pname, probe, resp))
+                    flagged = True
                     break
+            if flagged:
+                continue
+            # Boolean-differential: TRUE vs FALSE payloads that differ by one char.
+            for t_pay, f_pay in _SQLI_BOOL_PAIRS:
+                try:
+                    rt = ctx.get(r.fill_path({}), token=token, params={pname: t_pay})
+                    rf = ctx.get(r.fill_path({}), token=token, params={pname: f_pay})
+                except Exception as exc:
+                    ctx.note(f"boolean probe failed for GET {r.path}?{pname}: {exc}")
+                    break
+                if _materially_differ(rt, rf):
+                    bool_hits.append((r, pname, t_pay, f_pay, rt, rf))
+                    break
+
+    if bool_hits:
+        sample = "\n".join(
+            f"  GET {r.path}?{pname}: TRUE={t!r} -> {rt.status_code}/{len(rt.text)}B  "
+            f"FALSE={f!r} -> {rf.status_code}/{len(rf.text)}B"
+            for r, pname, t, f, rt, rf in bool_hits[:15]
+        )
+        r0, p0, t0, f0, _, _ = bool_hits[0]
+        ctx.finding(
+            id="a03-sqli-boolean",
+            owasp="A03", severity="HIGH",
+            title=f"Boolean-based SQL injection on {len(bool_hits)} param(s)",
+            summary=(
+                "Two payloads differing only in their boolean result (…\"1\"=\"1\" vs "
+                "…\"1\"=\"2\") produced materially different responses, so the parameter is "
+                "evaluated inside a SQL WHERE clause — a confirmed injection that returns data "
+                "conditionally. Unlike time-based probes this works on SQLite (no sleep "
+                "primitive) and on apps that mask SQL errors. Extract data with sqlmap and "
+                "switch to parameterised queries."
+            ),
+            evidence=sample,
+            route=f"GET {r0.path}",
+            request=f"GET {r0.fill_path({})}?{p0}={t0}   (vs FALSE {f0!r})",
+            reproduction=(
+                f"curl -s '{ctx.base_url}{r0.fill_path({})}?{p0}={t0}'  # TRUE: rows\n"
+                f"curl -s '{ctx.base_url}{r0.fill_path({})}?{p0}={f0}'  # FALSE: none"
+            ),
+            references=[REFS["ps-sqli"], REFS["A03"]],
+            tools=["sqlmap", "Burp Suite (Intruder)", "curl"],
+        )
 
     if error_hits:
         sample = "\n".join(
@@ -142,7 +216,7 @@ def _sqli_sweep(ctx: Context) -> None:
             references=[REFS["ps-sqli"], REFS["A03"]],
             tools=["sqlmap", "Burp Suite (Intruder)", "curl"],
         )
-    elif tested:
+    elif tested and not bool_hits:
         ctx.finding(
             id="a03-sqli-error-based",
             owasp="A03", severity="SAFE",
@@ -231,14 +305,18 @@ def _xss_probe(ctx: Context) -> None:
 
 
 def _operator_injection(ctx: Context) -> None:
-    """Light NoSQL/operator-injection probe on auth/filter JSON routes."""
+    """Light NoSQL/operator-injection probe on auth/filter JSON routes.
+
+    Covers declared-field bodies (swap each field for a ``{"$ne": null}`` operator)
+    AND schemaless free-form bodies — e.g. a search route reading ``request.json()``
+    directly into a Mongo query, which has no documented fields at all — by probing
+    common filter keys and watching for a filter bypass that returns every record."""
     if ctx.safe:
         ctx.note("safe mode: skipping mutating operator-injection probe")
         return
     targets = [
         r for r in ctx.routes.by_method("POST", "PUT", "PATCH")
-        if body_field_names(r)
-        and any(h in f"{r.path} {r.operation_id}".lower() for h in _OPINJ_HINT)
+        if any(h in f"{r.path} {r.operation_id}".lower() for h in _OPINJ_HINT)
     ][:15]
     if not targets:
         ctx.note("no auth/filter JSON routes; operator-injection probe skipped")
@@ -247,11 +325,16 @@ def _operator_injection(ctx: Context) -> None:
     hits = []
     for r in targets:
         fields = body_field_names(r)
-        # Baseline: a normal (wrong) string value — establishes the reject status.
-        benign = {f: _BENIGN for f in fields}
-        # Injection: swap each field for a Mongo-style operator object.
-        operator = {f: {"$ne": None} for f in fields}
         try:
+            if not fields:
+                found = _freeform_operator(ctx, r)   # schemaless body (request.json())
+                if found:
+                    hits.append(found)
+                continue
+            # Baseline: a normal (wrong) string value — establishes the reject status.
+            benign = {f: _BENIGN for f in fields}
+            # Injection: swap each field for a Mongo-style operator object.
+            operator = {f: {"$ne": None} for f in fields}
             base = ctx.request(r.method, r.fill_path({}), json=benign)
             inj = ctx.request(r.method, r.fill_path({}), json=operator)
         except Exception as exc:
@@ -263,6 +346,9 @@ def _operator_injection(ctx: Context) -> None:
             hits.append((r, base, inj, "500 on operator object"))
         elif inj.status_code < 300 and base.status_code in (400, 401, 403, 422):
             hits.append((r, base, inj, "bypass: operator accepted where benign was rejected"))
+        elif (inj.status_code < 300 and base.status_code < 300
+              and len(inj.text or "") - len(base.text or "") > 64):
+            hits.append((r, base, inj, "operator returned materially more data (filter bypass)"))
 
     if hits:
         sample = "\n".join(
@@ -299,6 +385,27 @@ def _operator_injection(ctx: Context) -> None:
                 "route(s); none errored or bypassed validation."
             ),
         )
+
+
+def _freeform_operator(ctx: Context, r):
+    """Probe a schemaless JSON-body route (fields not declared — the body is read
+    straight into a query) by placing a ``{"$ne": null}`` operator under common
+    filter keys and comparing to a benign value. A 500, or a materially larger
+    response (the filter matched every record), signals NoSQL operator injection."""
+    for key in _NOSQL_KEYS:
+        try:
+            base = ctx.request(r.method, r.fill_path({}), json={key: _BENIGN})
+            inj = ctx.request(r.method, r.fill_path({}), json={key: {"$ne": None}})
+        except Exception as exc:  # noqa: BLE001
+            ctx.note(f"free-form operator probe {r.method} {r.path} failed: {exc}")
+            return None
+        if inj.status_code >= 500 and base.status_code < 500:
+            return (r, base, inj, f"500 on {{{key!r}: {{$ne: null}}}}")
+        if (inj.status_code < 300 and base.status_code < 300
+                and len(inj.text or "") - len(base.text or "") > 64):
+            return (r, base, inj,
+                    f"{{{key!r}: {{$ne: null}}}} returned all records (filter bypass)")
+    return None
 
 
 # ── Server-side template injection (SSTI) ─────────────────────────────────────
