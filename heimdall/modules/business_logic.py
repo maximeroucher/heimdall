@@ -21,6 +21,8 @@ Writes state, so FULL mode only.
 
 from __future__ import annotations
 
+import re
+
 import requests
 
 from ..core.context import Context
@@ -46,6 +48,7 @@ def run(ctx: Context) -> None:
         return
 
     inversions: list[dict] = []
+    negatives: list[dict] = []
     validated = unreached = 0
     probed = 0
     for route, field in targets[:_MAX_FIELDS]:
@@ -55,18 +58,23 @@ def run(ctx: Context) -> None:
             validated += 1
         elif outcome == "unreached":
             unreached += 1
-        elif isinstance(outcome, dict):
+        elif isinstance(outcome, dict) and "inverted" in outcome:
             inversions.append(outcome)
+        elif isinstance(outcome, dict) and "negative_stored" in outcome:
+            negatives.append(outcome)
 
     ctx.note(f"business-logic: fuzzed {probed} numeric field(s) with ±values — "
-             f"{len(inversions)} inverted under negation, {validated} rejected "
-             f"the negative, {unreached} unreachable")
+             f"{len(inversions)} inverted under negation, {len(negatives)} stored a "
+             f"negative amount, {validated} rejected the negative, {unreached} unreachable")
     if inversions:
         _report(ctx, inversions)
-    elif validated:
-        _report_safe(ctx, validated, unreached)
-    elif unreached:
-        _report_untested(ctx, unreached)
+    if negatives:
+        _report_negative(ctx, negatives)
+    if not inversions and not negatives:
+        if validated:
+            _report_safe(ctx, validated, unreached)
+        elif unreached:
+            _report_untested(ctx, unreached)
 
 
 def _actor_token(ctx: Context) -> str | None:
@@ -134,6 +142,19 @@ def _probe_field(ctx, route, field, token):
     neg = _fire(ctx, route, field, _NEG, token)
     if pos is None or neg is None:
         return "unreached"
+
+    # A NEGATIVE value accepted and stored in an amount/quantity field — checked
+    # FIRST, because apps commonly bound the POSITIVE side (a stock/max cap that
+    # 400s our +1000) while leaving the negative unbounded (the real abuse). The
+    # ±inversion below needs both sides and also misses stateful/echo cases; a
+    # stored negative amount (negative order total, buyer credited) is the bug.
+    # Name-gated + baseline comparison to keep FP low.
+    if neg.status_code < 400 and _AMOUNTISH.search(field):
+        r0n, rn = _nums(base), _nums(neg)
+        neg_now = {k: v for k, v in rn.items() if v < 0}
+        if neg_now and not any(v < 0 for v in r0n.values()):
+            return {"route": route, "field": field, "negative_stored": neg_now}
+
     if pos.status_code < 400 and neg.status_code >= 400:
         return "validated"          # positive ok, negative rejected → bounds checked ✓
     if pos.status_code >= 400 or neg.status_code >= 400:
@@ -153,6 +174,13 @@ def _probe_field(ctx, route, field, token):
     if inverted:
         return {"route": route, "field": field, "inverted": inverted}
     return "validated"              # both accepted but nothing inverted → benign
+
+
+# amount / quantity-like field names — the ones where a stored NEGATIVE is abusable
+_AMOUNTISH = re.compile(
+    r"quantit|\bqty\b|amount|price|cost|total|balance|credit|debit|\bcount\b|units?|"
+    r"stock|point|coin|\bfund|fee|charge|payout|refund|discount|subtotal|wallet",
+    re.IGNORECASE)
 
 
 # ── findings ─────────────────────────────────────────────────────────────────
@@ -197,6 +225,37 @@ def _report(ctx: Context, inversions: list[dict]) -> None:
         references=[REFS["A04"], REFS["api6"],
                     "https://portswigger.net/web-security/logic-flaws"],
         tools=["Burp Suite (Repeater)", "curl"],
+    )
+
+
+def _report_negative(ctx: Context, negatives: list[dict]) -> None:
+    lead = negatives[0]
+    r = lead["route"]
+    lines = []
+    for x in negatives[:15]:
+        xr = x["route"]
+        sample = ", ".join(f"{k}={v}" for k, v in list(x["negative_stored"].items())[:3])
+        lines.append(f"  {xr.method} {xr.path}  field '{x['field']}' = {_NEG} accepted "
+                     f"-> response holds negative: {sample}")
+    ctx.finding(
+        id="a04-negative-amount", owasp="A04", severity="HIGH",
+        title=(f"Negative value accepted in amount/quantity field '{lead['field']}' "
+               f"on {r.method} {r.path}"
+               + (f" (+{len(negatives) - 1} more)" if len(negatives) > 1 else "")),
+        summary=(
+            "A quantity/amount/price field accepts a NEGATIVE value and stores it "
+            "(it comes back in the response). Fields like these feed downstream "
+            "arithmetic — a negative quantity yields a negative order total, a "
+            "negative amount credits the buyer, a negative transfer drains the "
+            "counterparty. Enforce a lower bound (>= 0 / > 0) at the schema and "
+            "in the business rule."),
+        evidence="\n".join(lines),
+        request=f"{r.method} {r.path}  ({lead['field']} = {_NEG})",
+        reproduction=(f"Send {r.method} {r.path} with '{lead['field']}' = {_NEG}; the "
+                      "negative is accepted and stored — then drive it through the "
+                      "checkout/payment/transfer flow and observe a negative total."),
+        references=[REFS["A04"]],
+        tools=["Burp (Repeater)", "curl"],
     )
 
 

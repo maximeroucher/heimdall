@@ -192,6 +192,32 @@ def test_a02_token_in_query_runs_without_authentication():
     assert any(f.id == "a02-token-in-query" for f in ctx.findings())
 
 
+def test_business_logic_negative_amount_asymmetric(monkeypatch):
+    """A negative accepted+stored in an amount/quantity field is flagged even when
+    the POSITIVE is rejected (stock/max cap) — the asymmetric-bound abuse; a
+    non-amount field is not (name gate)."""
+    from heimdall.modules import business_logic as bl
+
+    class _R:
+        def __init__(self, code, js):
+            self.status_code, self._js = code, js
+
+        def json(self):
+            return self._js
+
+    # base quantity=1 (ok); +1000 rejected (stock cap 400); -1000 accepted, stored
+    seq = {1: _R(200, {"quantity": 1}), 1000: _R(400, {"detail": "stock"}),
+           -1000: _R(200, {"quantity": -999})}
+    monkeypatch.setattr(bl, "_fire", lambda ctx, route, field, value, token: seq[value])
+
+    class _Route:
+        method, path, path_params = "POST", "/cart/", []
+
+    out = bl._probe_field(None, _Route(), "quantity", None)
+    assert isinstance(out, dict) and "negative_stored" in out      # amount field -> flagged
+    assert bl._probe_field(None, _Route(), "score", None) == "unreached"  # name gate
+
+
 def test_materially_differ_discriminates_boolean_sqli():
     from heimdall.modules import a03_injection as a03
 
