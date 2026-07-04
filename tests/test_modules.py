@@ -38,6 +38,24 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_websocket_authgate_recognizes_common_rejection_frames():
+    """A WS that rejects an unauthenticated connect by sending an auth-error frame
+    must be recognized as gated — otherwise it's falsely reported HIGH "serves data
+    without authentication". Legit data streams must stay non-gated so a genuinely
+    open socket still flags."""
+    from heimdall.modules.websocket import _looks_authgate
+
+    for frame in ("Could not validate credentials", "authentication required",
+                  "login required", "permission denied", "Unauthorized",
+                  "Not authenticated", "Access is not allowed"):
+        assert _looks_authgate(frame, "data"), frame
+    for legit in ('{"prices":[1,2,3],"symbol":"BTC"}', '{"msg":"welcome to the chat"}',
+                  '{"event":"tick","value":42}'):
+        assert not _looks_authgate(legit, "data"), legit
+    assert _looks_authgate("", "closed")          # transport close = rejection
+    assert not _looks_authgate("", "timeout")     # timeout is not a rejection signal
+
+
 def test_xxe_leak_detection_is_structural_not_substring():
     """XXE file-read confirmation must match a structural /etc/passwd account line,
     not a bare `/bin/bash` / `daemon:` substring that appears in env dumps or

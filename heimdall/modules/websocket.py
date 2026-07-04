@@ -30,8 +30,14 @@ from ..core.taxonomy import REFS
 from .base import module
 
 _ATTACKER_ORIGIN = "https://evil-heimdall-cswsh.test"
+# Wordings that mark a frame as an AUTH REJECTION rather than application data —
+# kept auth-specific (no bare "token"/"required"/status numbers) so a legitimate
+# data stream isn't misread as a rejection (which would hide a real unauth socket).
 _AUTH_ERROR_HINTS = ("invalid", "unauth", "forbidden", "denied", "expired",
-                     "not authenticated", "missing token", "error", "closed")
+                     "not authenticated", "missing token", "error", "closed",
+                     "authenticat",           # authentication/authenticate required
+                     "credential",            # "Could not validate credentials" (JWT default)
+                     "not allowed", "permission", "login")
 _MAX_ENDPOINTS = 10
 _TIMEOUT = 6
 
