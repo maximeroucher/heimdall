@@ -73,7 +73,7 @@ def scan_secrets(source_path: str, max_files: int = 400) -> list[Secret]:
                     source=f"{fp.relative_to(root)}:{lineno}", kind=kind,
                 ))
         # Whole-file pass for PEM private keys — they live on one very long,
-        # often \n-escaped line (e.g. the app's RSA_PRIVATE_PEM_STRING) that the
+        # often \n-escaped line (e.g. an RSA_PRIVATE_PEM_STRING env var) that the
         # line scanner skips. A committed private key enables direct RS/ES token
         # forgery and RS→HS algorithm confusion.
         for pem in _find_private_keys(text):

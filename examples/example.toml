@@ -1,0 +1,44 @@
+# Example Heimdall target config for a FastAPI app.
+#
+# Run with:
+#   heimdall --config examples/example.toml
+#
+# Copy to example.local.toml and fill in real credentials before running —
+# *.local.toml is git-ignored so secrets never get committed.
+
+# Where the app is listening. Heimdall refuses non-loopback targets unless you
+# also pass --i-have-authorization (authorized testing only).
+base_url = "http://127.0.0.1:8000"
+
+# Friendly name for the report header.
+name = "Example API"
+
+# Optional white-box source tree. Enables the JWT-secret recovery, `a06`
+# component audit and `sast` source-sink modules. Point it at your checkout.
+source_path = "/path/to/your-app"
+
+# Optional: let Heimdall boot the target itself, then tear it down afterwards.
+# launch = "uvicorn app.main:app --port 8000"
+# launch_cwd = "/path/to/your-app"
+
+# Optional: spin up a throwaway database matching the app's engine and, once it
+# is seeded, insert disposable test users so the access-control probes have real
+# cross-tenant subjects. Everything is dropped when the run ends.
+# spawn_db = true
+# provision_low_priv = 3
+# provision_admins = 1
+
+# Privileged accounts Heimdall cannot self-register. Each credential is
+# label / role / identifier / password; `role` is free-form and drives the
+# BFLA/BOLA pairing (an "admin" is attacked from a "user", and vice versa).
+[[credentials]]
+label = "admin"
+role = "admin"
+identifier = "admin@example.com"
+password = "change-me"
+
+[[credentials]]
+label = "member"
+role = "user"
+identifier = "member@example.com"
+password = "change-me"

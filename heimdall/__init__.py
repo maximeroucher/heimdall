@@ -11,8 +11,8 @@ Programmatic use:
 
     result = heimdall.assess(
         base_url="http://127.0.0.1:8000",
-        source_path="/path/to/the app",          # optional white-box
-        credentials=[("admin", "admin", "admin@ec.fr", "hunter2")],  # label,role,id,pw
+        source_path="/path/to/your-app",          # optional white-box
+        credentials=[("admin", "admin", "admin@example.com", "hunter2")],  # label,role,id,pw
     )
     print(result.counts())
     print(result.report_paths)

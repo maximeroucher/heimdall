@@ -192,8 +192,8 @@ def _provision(config, profile, principals: dict, db_url: str | None) -> None:
 
 def _mint_scoped_tokens(profile, principals: dict) -> None:
     """When the signing secret is recoverable, re-issue EVERY principal an
-    API-scoped token. Needed on apps whose login tokens are scope-limited (e.g.
-    the app's 'auth'-scoped simple_token that 403s the whole API) — this lifts
+    API-scoped token. Needed on apps whose login tokens are scope-limited (e.g. an
+    'auth'-scoped simple_token that 403s the rest of the API) — this lifts
     supplied admins AND provisioned users to a usable scope so the authorization
     matrix (BFLA both directions, BOLA) can actually be exercised."""
     from .bootstrap import minting
