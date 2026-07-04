@@ -56,12 +56,23 @@ def _sig_matches(token: str, secret: str) -> bool:
     return hmac.compare_digest(expected, sig)
 
 
-def _baseline_route(ctx: Context, real_token: str) -> str | None:
-    """A route the *legitimate* token is actually authorized on (HTTP < 300).
+# A structurally-valid but wrong-signature JWT. A route that truly enforces auth
+# must reject it (>= 400); one that returns 2xx for it is public and useless as an
+# acceptance oracle — any forgery would "pass" and produce false CRITICALs.
+_BOGUS_TOKEN = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                "eyJzdWIiOiJoZWltZGFsbC1uZWdhdGl2ZS1jb250cm9sIn0."
+                "aW52YWxpZC1zaWduYXR1cmUtaGVpbWRhbGw")
 
-    Needed as an acceptance oracle: some apps mint scope-limited tokens (e.g.
-    an OAuth 'auth' scope) that 403 on API routes, so 'me' alone is a poor probe.
-    We find a route the real token can reach, then replay forgeries against it.
+
+def _baseline_route(ctx: Context, real_token: str) -> str | None:
+    """A route usable as a JWT *acceptance oracle*: the legitimate token reaches
+    it (HTTP < 300) AND an invalid token is rejected (HTTP >= 400).
+
+    The negative control is essential — without it a public endpoint (e.g. DVR's
+    ``GET /menu``) accepts *every* token, so alg:none / kid / jwk / jku forgeries
+    all look "accepted" and fire false CRITICALs. Some apps also mint scope-limited
+    tokens (an OAuth 'auth' scope) that 403 real API routes, so 'me' alone is a poor
+    probe; we search for a genuinely auth-enforcing route instead.
     """
     if getattr(ctx, "_a02_baseline", "unset") != "unset":
         return ctx._a02_baseline  # cached (incl. cached None)
@@ -73,9 +84,12 @@ def _baseline_route(ctx: Context, real_token: str) -> str | None:
     found = None
     for path in candidates:
         try:
-            if ctx.get(path, token=real_token).status_code < 300:
-                found = path
-                break
+            if ctx.get(path, token=real_token).status_code >= 300:
+                continue  # real token can't reach it — not our oracle
+            if ctx.get(path, token=_BOGUS_TOKEN).status_code < 400:
+                continue  # public / not enforcing — a forgery here proves nothing
+            found = path
+            break
         except Exception:  # noqa: BLE001
             continue
     ctx._a02_baseline = found
@@ -83,18 +97,41 @@ def _baseline_route(ctx: Context, real_token: str) -> str | None:
 
 
 def _accepts(ctx: Context, token: str, real_token: str | None = None) -> tuple[bool, int]:
-    """Does a protected route accept this token? Probe a route the real token is
-    known-authorized on when we can, else fall back to the 'me' endpoint."""
-    path = _baseline_route(ctx, real_token) if real_token else None
-    if not path:
+    """Does an auth-enforcing route accept this token? Returns (accepted, code).
+
+    When ``real_token`` is given we require a validated oracle (accepts real,
+    rejects bogus); if none exists we return ``(False, -1)`` — *inconclusive*, so
+    callers never claim a bypass against a route that doesn't enforce auth."""
+    if real_token is not None:
+        path = _baseline_route(ctx, real_token)
+        if not path:
+            return False, -1  # no auth-enforcing oracle → cannot prove acceptance
+    else:
         path = ctx.auth.me_path
-    if not path:
-        cand = [r for r in ctx.routes.secured() if r.method == "GET" and not r.has_path_param]
-        if not cand:
-            return False, 0
-        path = cand[0].path
+        if not path:
+            cand = [r for r in ctx.routes.secured()
+                    if r.method == "GET" and not r.has_path_param]
+            if not cand:
+                return False, 0
+            path = cand[0].path
     r = ctx.get(path, token=token)
     return r.status_code < 300, r.status_code
+
+
+def _signatures_unverified(ctx: Context, header: dict, claims: dict,
+                           real_token: str) -> bool:
+    """True if a token with a corrupted signature is accepted — i.e. the server
+    does not verify signatures at all (the root cause behind alg:none/kid/jwk/jku).
+    Keeps the original alg so only the signature, not the algorithm, differs."""
+    parts = real_token.split(".")
+    if len(parts) != 3:
+        return False
+    body = _b64(json.dumps(_escalate(claims)).encode())
+    head = _b64(json.dumps(header).encode())
+    # a syntactically-valid but cryptographically-wrong signature
+    forged = f"{head}.{body}.aGVpbWRhbGwtaW52YWxpZC1zaWduYXR1cmU"
+    ok, _ = _accepts(ctx, forged, real_token)
+    return ok
 
 
 @module("a02", "Cryptographic Failures / JWT forging")
@@ -117,14 +154,54 @@ def run(ctx: Context) -> None:
     alg = header.get("alg", "?")
     ctx.note(f"JWT alg={alg}, claims={sorted(claims)}")
 
-    _alg_none(ctx, header, claims, token)
+    # Offline / oracle-free checks first (proof is cryptographic, not a server 200).
     _weak_secret(ctx, header, claims, token)
+    _token_in_query(ctx)
+
+    # Everything below concludes "forgery accepted" from a live 2xx, which is only
+    # meaningful against a route that actually enforces auth. If no such oracle
+    # exists, skip them rather than emit false CRITICALs off a public endpoint.
+    if not _baseline_route(ctx, token):
+        ctx.note("no auth-enforcing route found to serve as a JWT acceptance oracle "
+                 "(candidate routes are public or unreachable with the test principal); "
+                 "signature-bypass checks (alg:none/kid/jwk/jku/confusion) skipped")
+        return
+
+    # Root-cause probe: does the server verify signatures AT ALL? A token with the
+    # original alg but a deliberately wrong signature must be rejected. If it is
+    # accepted, signatures are simply not checked — reporting alg:none + kid + jwk +
+    # jku as four separate "attacks" mis-attributes ONE root cause to techniques
+    # that never engaged (e.g. a 'jku accepted' with zero fetches). Emit the single
+    # accurate finding instead.
+    if _signatures_unverified(ctx, header, claims, token):
+        ctx.finding(
+            id="a02-sig-not-verified", owasp="A02", severity="CRITICAL",
+            title="JWT signatures are not verified — any token is trusted",
+            summary=(
+                "A token with a valid structure but a deliberately INVALID signature was "
+                "accepted on a protected route. The server does not verify JWT signatures "
+                "at all, so an attacker mints tokens with arbitrary claims (any user, role "
+                "or scope) — complete authentication bypass. This is the root cause behind "
+                "alg:none / kid / jwk / jku acceptance; fix by enforcing signature "
+                "verification with a pinned algorithm and secret/key."
+            ),
+            evidence="token with a corrupted signature accepted on the protected oracle route "
+                     f"({ctx._a02_baseline}) — signature check is disabled",
+            reproduction="Take a valid JWT, flip a byte in the signature segment, replay it; "
+                         "it is still accepted.",
+            references=[REFS["ps-jwt"], REFS["A02"]],
+            tools=["jwt_tool", "Burp (JWT Editor)", "pyjwt"],
+        )
+        ctx.note("signatures not verified at all — skipping per-mechanism "
+                 "alg:none/kid/jwk/jku/confusion findings (same root cause)")
+        return
+
+    _alg_none(ctx, header, claims, token)
     _alg_confusion(ctx, header, claims, token)
     _leaked_private_key(ctx, header, claims, token)
     _kid_injection(ctx, header, claims, token)
     _jwk_injection(ctx, header, claims, token)
     _jku_injection(ctx, header, claims, token)
-    _token_in_query(ctx)
 
 
 def _escalate(claims: dict) -> dict:
@@ -154,7 +231,8 @@ def _alg_none(ctx: Context, header: dict, claims: dict, real_token: str) -> None
                     f"'{variant}' and no signature. Any party can mint a token with "
                     "arbitrary claims (including elevated role/scope) and be trusted."
                 ),
-                evidence=f"forged alg:{variant} token accepted at {ctx.auth.me_path} "
+                evidence=f"forged alg:{variant} token accepted at "
+                         f"{getattr(ctx, '_a02_baseline', None) or ctx.auth.me_path} "
                          f"(HTTP {code})\n{forged}",
                 reproduction="Take a valid JWT, set header alg to 'none', drop the "
                              "signature, escalate a role claim, and replay it.",
@@ -190,6 +268,9 @@ def _weak_secret(ctx: Context, header: dict, claims: dict, token: str) -> None:
         esc_ok, esc_code = _accepts(ctx, forged, token)
         if esc_ok:
             esc_note = f"\nre-signed forged token ACCEPTED live (HTTP {esc_code})"
+        elif esc_code == -1:
+            esc_note = ("\nno auth-enforcing route available to replay against; "
+                        "forgery still proven cryptographically")
         else:
             esc_note = (f"\nlive replay -> HTTP {esc_code} (token appears scope-limited; "
                         "forgery still proven cryptographically)")
@@ -504,7 +585,7 @@ def _jku_injection(ctx: Context, header: dict, claims: dict, token: str) -> None
             ok, code = _accepts(ctx, forged, token)
         fetched = bool(srv.hits)
 
-    if ok:
+    if ok and fetched:
         ctx.finding(
             id="a02-jku-header", owasp="A02", severity="CRITICAL",
             title="JWT 'jku' header injection — verifier fetches attacker JWKS",

@@ -18,9 +18,17 @@ from .openapi import body_field_names
 _LOGIN_HINTS = ("login", "token", "signin", "sign-in", "authenticate", "session")
 _LOGIN_NEG = ("refresh", "revoke", "logout", "reset", "forgot", "verify", "authorize")
 _REGISTER_HINTS = ("register", "signup", "sign-up", "users/create", "account")
-_ME_HINTS = ("/me", "current-user", "current_user", "whoami", "users/me")
+_ME_SEGMENTS = ("me", "whoami", "self", "current-user", "current_user")
 _USER_FIELDS = ("username", "email", "login", "user")
 _PASS_FIELDS = ("password", "passwd", "pass", "secret")
+
+
+def _is_me_path(path: str) -> bool:
+    """A 'current user' echo route. Match whole path *segments* so ``/menu`` is
+    not mistaken for ``/me`` (naive substring matching picked /menu on DVR, which
+    then poisoned every downstream auth probe that used it as an oracle)."""
+    segs = [s for s in path.lower().strip("/").split("/") if s]
+    return any(s in _ME_SEGMENTS for s in segs)
 
 
 def _content_types(route: Route) -> list[str]:
@@ -145,12 +153,12 @@ def detect_auth(rm: RouteMap) -> AuthProfile:
     if reg_best is not None:
         ap.register_path = reg_best.path
         ap.register_fields = body_field_names(reg_best)
+        ap.register_schema = reg_best.body_schema
 
     # -- "me" endpoint ---------------------------------------------------------
     # Prefer the least-nested current-user route (core /users/me over a
     # module-scoped /loans/users/me, which needs extra scope and misleads probes).
-    me_hits = [r.path for r in rm.by_method("GET")
-               if any(h in r.path.lower() for h in _ME_HINTS)]
+    me_hits = [r.path for r in rm.by_method("GET") if _is_me_path(r.path)]
     if me_hits:
         ap.me_path = min(me_hits, key=lambda p: (p.count("/"), len(p)))
 

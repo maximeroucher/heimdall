@@ -108,9 +108,11 @@ def _whoami(http: HttpClient, profile: AppProfile, token: str) -> str | None:
     if r.status_code == 200:
         try:
             body = r.json()
-            return str(body.get("id") or body.get("user_id") or body.get("sub") or "") or None
         except ValueError:
             return None
+        if not isinstance(body, dict):
+            return None  # a "me" route that returns a list/scalar isn't an identity echo
+        return str(body.get("id") or body.get("user_id") or body.get("sub") or "") or None
     return None
 
 
@@ -153,24 +155,87 @@ def bootstrap(profile: AppProfile, creds: list[Cred], *,
     return principals
 
 
+def _synth_field(name: str, spec: dict, *, ident: str, username: str,
+                 password: str) -> object:
+    """Invent a plausible value for one register-body field, from its name and
+    JSON-schema type/format. Lets self-registration satisfy required fields a
+    given app demands beyond the canonical email/username/password (e.g. DVR's
+    required ``phone_number``), instead of 422-ing and yielding no attacker."""
+    low = name.lower()
+    fmt = str(spec.get("format", "")).lower()
+    # unwrap Optional[...] / anyOf so a nullable field still gets a typed guess
+    typ = spec.get("type")
+    if not typ:
+        for sub in spec.get("anyOf", []) + spec.get("oneOf", []):
+            if isinstance(sub, dict) and sub.get("type") not in (None, "null"):
+                typ = sub.get("type")
+                fmt = fmt or str(sub.get("format", "")).lower()
+                break
+    if "enum" in spec and isinstance(spec["enum"], list) and spec["enum"]:
+        return spec["enum"][0]
+    # name/format-driven canonical values first
+    if "email" in low or fmt == "email":
+        return ident
+    if any(k in low for k in ("password", "passwd", "pwd")):
+        return password
+    if "username" in low or low in ("user", "login", "handle"):
+        return username
+    if "phone" in low or "mobile" in low or "tel" in low:
+        return "+15555550123"
+    if fmt in ("uri", "url") or "url" in low:
+        return "https://example.com"
+    if fmt == "uuid":
+        return "00000000-0000-0000-0000-000000000000"
+    if fmt in ("date-time", "datetime"):
+        return "2026-01-01T00:00:00Z"
+    if fmt == "date":
+        return "2026-01-01"
+    if any(k in low for k in ("first", "given")):
+        return "Heim"
+    if any(k in low for k in ("last", "family", "surname")):
+        return "Dall"
+    if "name" in low:
+        return "Heimdall"
+    # type-driven fallback
+    if typ == "integer":
+        return 1
+    if typ == "number":
+        return 1
+    if typ == "boolean":
+        return False
+    if typ == "array":
+        return []
+    if typ == "object":
+        return {}
+    return "heimdall"
+
+
 def _register_attacker(http: HttpClient, profile: AppProfile) -> Principal | None:
     ap = profile.auth
     ident = "heimdall.attacker@example.com"
     username = "heimdall_attacker"
     password = "Heimdall!Attacker#2026"
     fields = {f.lower(): f for f in ap.register_fields}
+    schema = ap.register_schema or {}
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    props = props if isinstance(props, dict) else {}
+    required = schema.get("required") if isinstance(schema, dict) else None
+    required = required if isinstance(required, list) else []
+
     payload: dict = {}
+    # Fill EVERY required field with a typed synthetic value so apps that demand
+    # extra fields (phone, dob, …) still register. Canonical creds win by name.
+    for fname in required:
+        spec = props.get(fname, {}) if isinstance(props.get(fname), dict) else {}
+        payload[fname] = _synth_field(fname, spec, ident=ident,
+                                      username=username, password=password)
+    # Always ensure the login triple is present (some apps under-declare required).
     if "email" in fields:
         payload[fields["email"]] = ident
     if "username" in fields:
         payload[fields["username"]] = username
     if "password" in fields:
         payload[fields["password"]] = password
-    # sensible defaults for other required-ish fields
-    for maybe, val in (("name", "Heimdall"), ("full_name", "Heimdall Attacker"),
-                       ("firstname", "Heim"), ("lastname", "Dall")):
-        if maybe in fields:
-            payload[fields[maybe]] = val
     if not payload:
         payload = {"email": ident, "username": username, "password": password}
 

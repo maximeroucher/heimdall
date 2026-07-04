@@ -86,6 +86,7 @@ class AuthProfile:
     scopes_field: str | None = None  # e.g. OAuth "scope" sent on token request
     register_path: str | None = None
     register_fields: list[str] = field(default_factory=list)
+    register_schema: dict | None = None  # resolved body schema (props + required)
     me_path: str | None = None       # a "current user" echo endpoint
     logout_path: str | None = None
     header_scheme: str = "Bearer"    # Authorization: <scheme> <token>

@@ -142,3 +142,35 @@ def test_index_websocket_routes_finds_decorators_and_prefixes(tmp_path):
     assert {"/cdr/users/ws", "/live", "/added/ws"} <= paths   # raw decorator paths
     assert "/api/cdr/users/ws" in paths                        # prefixed variant too
     assert all(":" in loc for _p, loc in routes)               # each has file:line
+
+
+def test_is_me_path_matches_segments_not_substrings():
+    # /me-style routes match on whole path segments...
+    assert auth_detect._is_me_path("/me") is True
+    assert auth_detect._is_me_path("/users/me") is True
+    assert auth_detect._is_me_path("/api/v1/whoami") is True
+    assert auth_detect._is_me_path("/account/self") is True
+    # ...but a substring like "me" inside "menu" must NOT (this picked /menu on DVR,
+    # a public route, which then poisoned the JWT acceptance oracle).
+    assert auth_detect._is_me_path("/menu") is False
+    assert auth_detect._is_me_path("/members") is False
+    assert auth_detect._is_me_path("/home") is False
+
+
+def test_register_schema_and_required_fields_captured():
+    # A register body with an extra required field beyond username/password must be
+    # carried on the AuthProfile so self-registration can satisfy it.
+    spec = make_spec({
+        "/register": {"post": {"operationId": "register", "requestBody": {"content": {
+            "application/json": {"schema": {
+                "type": "object",
+                "required": ["username", "password", "phone_number"],
+                "properties": {"username": {"type": "string"},
+                               "password": {"type": "string"},
+                               "phone_number": {"type": "string"}},
+            }}}}}},
+    })
+    ap = auth_detect.detect_auth(oa.parse_routes(spec))
+    assert ap.register_path == "/register"
+    assert ap.register_schema is not None
+    assert set(ap.register_schema.get("required", [])) == {"username", "password", "phone_number"}

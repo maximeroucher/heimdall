@@ -51,3 +51,23 @@ def test_declared_scopes_from_openapi():
     rm = RouteMap(openapi=spec, components=spec["components"])
     p = AppProfile(base_url="http://x", routes=rm)
     assert minting.declared_scopes(p) == "API openid"
+
+
+def test_synth_field_fills_required_types():
+    from heimdall.bootstrap.principals import _synth_field
+    kw = dict(ident="a@b.co", username="atk", password="Pw!23")
+    # canonical fields resolve to the login triple
+    assert _synth_field("email", {"type": "string"}, **kw) == "a@b.co"
+    assert _synth_field("password", {"type": "string"}, **kw) == "Pw!23"
+    assert _synth_field("username", {"type": "string"}, **kw) == "atk"
+    # extra required fields get type/format/name-appropriate values (not dropped)
+    assert isinstance(_synth_field("phone_number", {"type": "string"}, **kw), str)
+    assert "@" not in _synth_field("phone_number", {"type": "string"}, **kw)
+    assert _synth_field("age", {"type": "integer"}, **kw) == 1
+    assert _synth_field("accept_tos", {"type": "boolean"}, **kw) is False
+    assert _synth_field("tags", {"type": "array"}, **kw) == []
+    # nullable Optional[str] (anyOf) still yields a typed guess, not None
+    opt = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert _synth_field("first_name", opt, **kw) == "Heim"
+    # enum picks a valid member
+    assert _synth_field("role", {"enum": ["user", "admin"]}, **kw) == "user"
