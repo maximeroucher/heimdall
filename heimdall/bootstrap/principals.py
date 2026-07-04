@@ -35,8 +35,8 @@ def _extract_token(body: dict) -> str | None:
     for f in _TOKEN_FIELDS:
         if body.get(f):
             return body[f]
-    # nested {"data": {...}} or {"tokens": {...}}
-    for wrap in ("data", "tokens", "result"):
+    # nested {"data": {...}} / {"tokens": {...}} / {"user": {...}} (RealWorld)
+    for wrap in ("data", "tokens", "result", "user"):
         inner = body.get(wrap)
         if isinstance(inner, dict):
             t = _extract_token(inner)
@@ -64,7 +64,10 @@ def login(http: HttpClient, profile: AppProfile, ident: str, password: str) -> s
                     data[ap.scopes_field] = "API"
             r = http.post(ap.login_path, data=data)
         else:
-            r = http.post(ap.login_path, json={uf: ident, pf: password})
+            body = {uf: ident, pf: password}
+            if ap.login_wrapper:
+                body = {ap.login_wrapper: body}   # {"user": {...}} envelope
+            r = http.post(ap.login_path, json=body)
         if r.status_code == 200:
             try:
                 tok = _extract_token(r.json())
@@ -239,7 +242,8 @@ def _register_attacker(http: HttpClient, profile: AppProfile) -> Principal | Non
     if not payload:
         payload = {"email": ident, "username": username, "password": password}
 
-    r = http.post(ap.register_path, json=payload)
+    body = {ap.register_wrapper: payload} if ap.register_wrapper else payload
+    r = http.post(ap.register_path, json=body)
     tok = None
     if r.status_code in (200, 201):
         try:

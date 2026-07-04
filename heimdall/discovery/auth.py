@@ -23,6 +23,28 @@ _USER_FIELDS = ("username", "email", "login", "user")
 _PASS_FIELDS = ("password", "passwd", "pass", "secret")
 
 
+def _unwrap_envelope(schema: dict | None) -> tuple[str | None, dict]:
+    """RealWorld / JSON:API style bodies nest credentials under a single wrapper
+    object, e.g. ``{"user": {"email": .., "password": ..}}``. Detect a lone
+    object-typed property whose sub-fields look like credentials and return
+    ``(wrapper_key, sub_schema)`` so field detection and payload building target
+    the nested object instead of seeing just ``["user"]``. Returns ``(None, schema)``
+    when the body is already flat."""
+    if not isinstance(schema, dict):
+        return None, {}
+    props = schema.get("properties")
+    if not isinstance(props, dict) or len(props) != 1:
+        return None, schema
+    key, sub = next(iter(props.items()))
+    subprops = sub.get("properties") if isinstance(sub, dict) else None
+    if not isinstance(subprops, dict):
+        return None, schema
+    names = {n.lower() for n in subprops}
+    if any(u in names for u in _USER_FIELDS) or any(p in names for p in _PASS_FIELDS):
+        return key, sub
+    return None, schema
+
+
 def _is_me_path(path: str) -> bool:
     """A 'current user' echo route. Match whole path *segments* so ``/menu`` is
     not mistaken for ``/me`` (naive substring matching picked /menu on DVR, which
@@ -120,6 +142,10 @@ def detect_auth(rm: RouteMap) -> AuthProfile:
                 ap.scopes_field = "scope"
         else:
             ap.login_style = "json"
+            wrapper, eff = _unwrap_envelope(best.body_schema)
+            ap.login_wrapper = wrapper
+            if wrapper:
+                fields = list((eff.get("properties") or {}).keys())
             ap.username_field = _pick_field(fields, _USER_FIELDS, "username")
             ap.password_field = _pick_field(fields, _PASS_FIELDS, "password")
 
@@ -134,7 +160,9 @@ def detect_auth(rm: RouteMap) -> AuthProfile:
         if not any(h in blob for h in _REGISTER_HINTS):
             return -1
         score = 0
-        fields = [f.lower() for f in body_field_names(r)]
+        _wrap, _eff = _unwrap_envelope(r.body_schema)
+        fields = ([f.lower() for f in (_eff.get("properties") or {})] if _wrap
+                  else [f.lower() for f in body_field_names(r)])
         if any(u in fields for u in _USER_FIELDS):
             score += 2
         if any(pw in fields for pw in _PASS_FIELDS):
@@ -152,8 +180,14 @@ def detect_auth(rm: RouteMap) -> AuthProfile:
             reg_best, reg_score = r, sc
     if reg_best is not None:
         ap.register_path = reg_best.path
-        ap.register_fields = body_field_names(reg_best)
-        ap.register_schema = reg_best.body_schema
+        reg_wrapper, reg_eff = _unwrap_envelope(reg_best.body_schema)
+        ap.register_wrapper = reg_wrapper
+        if reg_wrapper:
+            ap.register_schema = reg_eff
+            ap.register_fields = list((reg_eff.get("properties") or {}).keys())
+        else:
+            ap.register_fields = body_field_names(reg_best)
+            ap.register_schema = reg_best.body_schema
 
     # -- "me" endpoint ---------------------------------------------------------
     # Prefer the least-nested current-user route (core /users/me over a

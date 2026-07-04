@@ -82,6 +82,8 @@ class AuthProfile:
     login_style: str = "json"        # "json" | "form" | "oauth_password" | "unknown"
     username_field: str = "username"
     password_field: str = "password"
+    login_wrapper: str | None = None    # JSON envelope key, e.g. {"user": {...}}
+    register_wrapper: str | None = None
     token_response_field: str = "access_token"
     scopes_field: str | None = None  # e.g. OAuth "scope" sent on token request
     register_path: str | None = None
