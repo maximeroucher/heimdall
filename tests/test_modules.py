@@ -152,3 +152,44 @@ def test_sast_callgraph_resolves_sink_to_handler_route(tmp_path):
     assert len(cmdi) == 1
     routes = sast._routes_for_sink(cmdi[0], graph["handlers"], graph["calls"])
     assert ("get", "/admin/disk") in routes         # resolved util sink -> its handler route
+
+
+def test_sast_escalation_tokens_forge_elevated_claims():
+    import jwt as pyjwt
+    from heimdall.core.context import Context
+    from heimdall.core.model import AppProfile
+    from heimdall.discovery import auth as auth_detect
+    from heimdall.modules import sast
+
+    base = pyjwt.encode({"sub": "alice", "role": "user"}, "k", algorithm="HS256")
+    ctx = Context(AppProfile(base_url="http://x"))
+    toks = sast._escalation_tokens(ctx, base)
+    assert toks, "expected forged escalation tokens"
+    # at least one forged token decodes to an elevated role (alg:none, unverified)
+    elevated = []
+    for tok, _how in toks:
+        dec = auth_detect.decode_jwt(tok)
+        if dec and dec[1].get("role") in ("admin", "super_admin"):
+            elevated.append(dec[1]["role"])
+    assert "admin" in elevated
+    assert any("alg:none" in how for _t, how in toks)
+
+
+def test_sast_urlish_param_matching():
+    from heimdall.modules import sast
+    assert sast._URLISH.search("image_url")
+    assert sast._URLISH.search("callback")
+    assert sast._URLISH.search("avatar")
+    assert not sast._URLISH.search("quantity")
+    assert not sast._URLISH.search("email")
+
+
+def test_sast_canary_records_fetch():
+    import urllib.request
+    from heimdall.modules import sast
+
+    with sast._Canary() as c:
+        urllib.request.urlopen(f"http://127.0.0.1:{c.port}/heimdall-ssrf", timeout=3).read()
+        import time
+        time.sleep(0.2)
+        assert c.hits and "/heimdall-ssrf" in c.hits[0]

