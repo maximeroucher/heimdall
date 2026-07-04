@@ -62,6 +62,32 @@ def _sast_scan(sast, src):
     return out, graph
 
 
+def _sast_full_scan(sast, src):
+    """Mirror run()'s pre-pass: collect cross-file auth aliases + router-graph
+    auth before scanning, so multi-file auth patterns resolve correctly."""
+    import ast
+    import os
+    root = str(src)
+    graph = {"sinks": [], "handlers": {}, "calls": {}, "auth_aliases": set()}
+    top_pkg = os.path.basename(root.rstrip("/"))
+    files = list(sast._iter_py(root))
+    parsed = []
+    for p in files:
+        try:
+            tree = ast.parse(open(p).read(), filename=p)
+        except (SyntaxError, ValueError):
+            continue
+        sast._collect_auth_aliases(tree, graph["auth_aliases"])
+        parsed.append((sast._module_key(os.path.relpath(p, root)), tree))
+    graph["protected_routers"] = sast._resolve_protected_routers(parsed, top_pkg)
+    for p in files:
+        sast._scan_file(p, os.path.relpath(p, root), open(p).readlines(), graph)
+    out = {}
+    for s in graph["sinks"]:
+        out.setdefault(s["kind"], []).append((s["loc"], s["code"]))
+    return out, graph
+
+
 def test_sast_detects_sinks_and_suppresses_public(tmp_path):
     from heimdall.modules import sast
 
@@ -203,6 +229,120 @@ def test_sast_ssti_file_read_template_not_flagged(tmp_path):
     ssti_codes = [c for _, c in hits.get("ssti", [])]
     assert len(ssti_codes) == 1
     assert any("user_supplied" in c for c in ssti_codes)
+
+
+def test_sast_router_composition_auth_suppresses_noauth(tmp_path):
+    """Auth applied once at router assembly — `include_router(child,
+    dependencies=[Depends(get_current_user)])` — protects every route on the
+    child router even though no handler declares its own dep (Netflix/dispatch)."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    (src / "entity").mkdir(parents=True)
+    (src / "entity" / "views.py").write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.post('')\n"
+        "def create_entity(body):\n"          # no per-handler dep...
+        "    ...\n"
+        "@router.delete('/{entity_id}')\n"
+        "def delete_entity(entity_id):\n"
+        "    ...\n"
+    )
+    (src / "api.py").write_text(
+        "from fastapi import APIRouter, Depends\n"
+        "from app.entity.views import router as entity_router\n"
+        "api_router = APIRouter()\n"
+        "authed = APIRouter()\n"
+        "authed.include_router(entity_router, prefix='/entities')\n"
+        "api_router.include_router(authed, dependencies=[Depends(get_current_user)])\n"
+    )
+    hits, graph = _sast_full_scan(sast, src)
+    assert ("entity.views", "router") in graph["protected_routers"]
+    assert "noauth" not in hits          # ...protected via composition
+
+
+def test_sast_webhook_signature_verification_suppresses_noauth(tmp_path):
+    """A handler that verifies an inbound request signature (webhook HMAC) is
+    authenticated even with no Depends."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "hooks.py").write_text(
+        "from fastapi import APIRouter, Request\n"
+        "from slack_sdk.signature import SignatureVerifier\n"
+        "router = APIRouter()\n"
+        "def _ok(body, headers):\n"
+        "    return SignatureVerifier('s').is_valid_request(body, headers)\n"
+        "@router.post('/slack/event')\n"
+        "def slack_event(request: Request):\n"
+        "    ...\n"
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    assert "noauth" not in hits
+
+
+def test_sast_ssti_trusted_sources_not_flagged(tmp_path):
+    """Module constants and static config dicts are trusted templates; request-
+    derived or built strings are SSTI."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "t.py").write_text(
+        "from jinja2 import Template, Environment\n"
+        "SUMMARY_TEMPLATE = 'Hi {{ name }}'\n"
+        "env = Environment()\n"
+        "def render_const(ctx):\n"
+        "    return Template(SUMMARY_TEMPLATE).render(ctx)\n"          # const -> trusted
+        "def render_cfg(cfg, ctx):\n"
+        "    return env.from_string(cfg['header']).render(ctx)\n"       # config dict -> trusted
+        "def render_user(request, ctx):\n"
+        "    return Template(request['tpl']).render(ctx)\n"            # request -> SSTI
+        "def render_built(name, ctx):\n"
+        "    return Template('Hi ' + name).render(ctx)\n"              # built -> SSTI
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    codes = [c for _, c in hits.get("ssti", [])]
+    assert len(codes) == 2
+    assert any("request['tpl']" in c for c in codes)
+    assert any("'Hi ' + name" in c for c in codes)
+
+
+def test_sast_ssrf_constant_url_not_flagged(tmp_path):
+    """A config/constant URL is not attacker-influenceable — not SSRF; a
+    variable URL is a lead."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "clients.py").write_text(
+        "import requests\n"
+        "JWKS_URL = 'https://issuer/.well-known/jwks.json'\n"
+        "def keys():\n"
+        "    return requests.get(JWKS_URL).json()\n"                  # const -> not SSRF
+        "def fetch(url):\n"
+        "    return requests.get(url)\n"                              # variable -> lead
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    codes = [c for _, c in hits.get("ssrf", [])]
+    assert not any("JWKS_URL" in c for c in codes)
+    assert any("requests.get(url)" in c for c in codes)
+
+
+def test_sast_skips_migration_dirs(tmp_path):
+    """Alembic revision/version DDL is offline, not a web-reachable SQLi sink."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    (src / "revisions" / "versions").mkdir(parents=True)
+    (src / "revisions" / "versions" / "0001_x.py").write_text(
+        "def upgrade():\n"
+        "    conn.execute(f\"update t set s = '{r[1]}' where id = {r[0]}\")\n"
+    )
+    scanned = [p for p in sast._iter_py(str(src))]
+    assert scanned == []                 # whole revisions subtree skipped
 
 
 def test_race_excludes_delete_from_candidates():

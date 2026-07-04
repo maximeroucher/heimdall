@@ -48,6 +48,9 @@ from .base import module
 _SKIP_DIRS = {
     ".git", "node_modules", ".venv", "venv", "env", "__pycache__", "site-packages",
     "migrations", ".tox", "dist", "build", ".mypy_cache", ".pytest_cache", "tests",
+    # offline DB schema/DDL scripts — run by an admin, never reachable from an
+    # HTTP request, so their f-string DDL is not a web-exploitable SQLi sink
+    "revisions", "versions", "alembic",
 }
 _MAX_FILES = 3000
 _PS_CMDI = "https://portswigger.net/web-security/os-command-injection"
@@ -105,6 +108,35 @@ def _built_string(n: ast.AST | None) -> bool:
     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "format":
         return True
     return False
+
+
+# A template compiled from a request-derived / interpolated string is SSTI; one
+# compiled from a module constant or static config dict is a trusted, developer-
+# authored template (the overwhelmingly common case). Require a positive taint
+# signal instead of flagging every non-literal template argument.
+_TAINT_SRC = re.compile(
+    r"request|\breq\b|body|payload|form|json|param|query|\barg|input|user|submitted|"
+    r"incoming|untrusted|external|client", re.IGNORECASE)
+
+
+def _root_name(node: ast.AST | None) -> str:
+    """The root identifier of a Name/Attribute/Subscript expression."""
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def _ssti_is_tainted(a0: ast.AST, fn: str | None, file_vars: dict, module_consts: set) -> bool:
+    """True only if a template argument shows evidence of untrusted/interpolated
+    input — a built string, or a value rooted in request/user input. Module
+    constants (``ALL_CAPS`` or module-level string literals), file reads, and
+    static config subscripts (``d["header"]``) are trusted, not SSTI."""
+    if isinstance(a0, ast.Name):
+        if a0.id.isupper() or a0.id in file_vars.get(fn, ()) or a0.id in module_consts:
+            return False
+    if _built_string(a0):
+        return True
+    return bool(_root_name(a0) and _TAINT_SRC.search(_root_name(a0)))
 
 
 _FILE_READ_TAILS = ("read_text", "read_bytes", "read", "get_data", "read_string")
@@ -187,6 +219,129 @@ def _collect_auth_aliases_text(src: str, aliases: set) -> None:
         name, dep = m.group(1), m.group(2)
         if _auth_ish(dep.split(".")[-1]):
             aliases.add(name)
+
+
+def _deps_list_has_auth(deps_node) -> bool:
+    """True if a ``dependencies=[...]`` node contains an auth ``Depends()``."""
+    if deps_node is None:
+        return False
+    for sub in ast.walk(deps_node):
+        if isinstance(sub, ast.Call) and _callee(sub).split(".")[-1] == "Depends" and sub.args:
+            if _depends_is_auth(sub):
+                return True
+    return False
+
+
+def _module_key(rel: str) -> str:
+    """Dotted module key from a path relative to the source root."""
+    m = rel.replace(os.sep, "/")
+    if m.endswith(".py"):
+        m = m[:-3]
+    if m.endswith("/__init__"):
+        m = m[:-len("/__init__")]
+    return m.replace("/", ".").strip(".")
+
+
+def _resolve_import_module(node: ast.ImportFrom, cur_module: str, top_pkg: str) -> str:
+    """Target module key for ``from X import ...`` (relative + top-pkg aware)."""
+    if node.level and node.level > 0:
+        base = cur_module.split(".")[:-1]            # package of current module
+        if node.level > 1:
+            base = base[:max(0, len(base) - (node.level - 1))]
+        parts = base + ([node.module] if node.module else [])
+        return ".".join(p for p in parts if p)
+    m = node.module or ""
+    if top_pkg and (m == top_pkg or m.startswith(top_pkg + ".")):
+        m = m[len(top_pkg) + 1:]
+    return m
+
+
+def _resolve_protected_routers(parsed: list, top_pkg: str) -> set:
+    """Router symbols ``(module_key, var)`` that inherit an auth dependency via
+    router composition — ``include_router(child, dependencies=[Depends(auth)])``
+    or an ``APIRouter(dependencies=[Depends(auth)])`` constructor.
+
+    This models the dominant large-app FastAPI pattern where auth is applied
+    once at router assembly (e.g. Netflix/dispatch) rather than on each handler.
+    Import aliases are resolved so a router defined as ``router`` in one file and
+    mounted (as an alias) under an auth dep in another is recognised.
+    """
+    protected: set = set()
+    edges: list = []                     # (parent_sym, child_sym, has_auth)
+    for module_key, tree in parsed:
+        alias_map: dict = {}             # local name -> (target_module, orig_name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                tgt = _resolve_import_module(node, module_key, top_pkg)
+                for a in node.names:
+                    alias_map[a.asname or a.name] = (tgt, a.name)
+
+        def _sym(child):
+            # `router` (Name) -> local or imported symbol; `mod.router` (Attr) ->
+            # symbol in the imported submodule.
+            if isinstance(child, ast.Name):
+                return alias_map.get(child.id, (module_key, child.id))
+            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
+                tmod, torig = alias_map.get(child.value.id, (module_key, child.value.id))
+                mod = f"{tmod}.{torig}" if tmod else torig
+                return (mod, child.attr)
+            return None
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                if (_callee(node.value).split(".")[-1] == "APIRouter"
+                        and _deps_list_has_auth(_kwarg(node.value, "dependencies"))):
+                    for t in node.targets:
+                        if isinstance(t, ast.Name):
+                            protected.add((module_key, t.id))
+            elif isinstance(node, ast.Call) and _callee(node).split(".")[-1] == "include_router":
+                pv = node.func.value if isinstance(node.func, ast.Attribute) else None
+                if not isinstance(pv, ast.Name) or not node.args:
+                    continue
+                child_sym = _sym(node.args[0])
+                if child_sym is None:
+                    continue
+                edges.append(((module_key, pv.id), child_sym,
+                              _deps_list_has_auth(_kwarg(node, "dependencies"))))
+
+    changed = True                       # child protected if its edge carries
+    while changed:                       # auth OR its parent is protected
+        changed = False
+        for parent_sym, child_sym, has_auth in edges:
+            if child_sym not in protected and (has_auth or parent_sym in protected):
+                protected.add(child_sym)
+                changed = True
+    return protected
+
+
+_SIG_VERIFY_CALLS = ("is_valid_request", "compare_digest", "verify_signature",
+                     "verify_webhook", "verify_request", "validate_signature",
+                     "check_signature", "verifysignature")
+_SIG_VERIFY_CTORS = ("signatureverifier", "webhookverifier", "signatureverification")
+
+
+def _verifies_signature(tree: ast.AST) -> bool:
+    """True if a module performs inbound request-signature verification (webhook
+    HMAC auth — Slack/Stripe/GitHub style). Such a handler is authenticated even
+    with no ``Depends``: it rejects any request lacking a valid signed body.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            tail = _callee(node).split(".")[-1]
+            low = tail.lower()
+            if tail in _SIG_VERIFY_CALLS or low in _SIG_VERIFY_CTORS:
+                return True
+            if "signature" in low and any(w in low for w in ("verif", "valid", "check")):
+                return True
+    return False
+
+
+def _decorator_router_var(dec: ast.AST) -> str | None:
+    """The router variable a route decorator hangs off: ``@router.post`` -> 'router'."""
+    if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute):
+        if isinstance(dec.func.value, ast.Name):
+            return dec.func.value.id
+    return None
 
 
 def _handler_has_auth(fn: ast.AST, aliases: set | tuple = ()) -> bool:
@@ -276,6 +431,9 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
     calls = graph["calls"]
     aliases = graph.setdefault("auth_aliases", set())
     _collect_auth_aliases(tree, aliases)  # also catch same-file alias defs
+    protected = graph.get("protected_routers", frozenset())
+    module_key = _module_key(rel)
+    sig_authed = _verifies_signature(tree)  # webhook HMAC auth in this module
 
     # per-function: local vars whose value is read from the filesystem
     file_vars: dict[str | None, set] = {}
@@ -285,6 +443,15 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
             for t in node.targets:
                 if isinstance(t, ast.Name):
                     file_vars.setdefault(fn2, set()).add(t.id)
+
+    # module-level string constants: trusted template sources (e.g. a
+    # developer-authored ``INCIDENT_SUMMARY_TEMPLATE = "..."``)
+    module_consts: set = set()
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Constant, ast.JoinedStr)):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    module_consts.add(t.id)
 
     def snippet(node) -> str:
         i = node.lineno - 1
@@ -314,10 +481,14 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
             elif (name.startswith(_HTTP_FETCH_ROOTS) or name in (
                     "urllib.request.urlopen", "urlopen")) and tail in _FETCH_VERBS + ("urlopen",):
                 if isinstance(a0, (ast.Name, ast.BinOp, ast.JoinedStr, ast.Subscript)):
-                    add("ssrf", node)
+                    # a constant/config URL (ALL_CAPS or module-level constant) is
+                    # not attacker-influenceable — not SSRF
+                    if not (isinstance(a0, ast.Name) and (a0.id.isupper() or a0.id in module_consts)):
+                        add("ssrf", node)
             elif tail in ("Template", "from_string", "render_template_string") and _dynamic(a0):
-                # a template compiled from a file read on disk is trusted, not SSTI
-                if not (isinstance(a0, ast.Name) and a0.id in file_vars.get(fn, ())):
+                # flag only templates built from interpolated / request-derived
+                # input; module constants and static config are trusted
+                if _ssti_is_tainted(a0, fn, file_vars, module_consts):
                     add("ssti", node)
             elif tail in ("execute", "executemany", "executescript", "text", "raw") and _built_string(a0):
                 add("sqli", node)
@@ -343,7 +514,10 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                 if route[0] in ("post", "put", "patch", "delete"):
                     public = (_PUBLIC_ROUTE.search(route[1]) or _PUBLIC_ROUTE.search(node.name)
                               or _CAP_TOKEN_PARAM.search(route[1]))
-                    if not (_handler_has_auth(node, aliases) or _decorator_deps_auth(dec)) and not public:
+                    rvar = _decorator_router_var(dec)
+                    router_authed = rvar is not None and (module_key, rvar) in protected
+                    if not (_handler_has_auth(node, aliases) or _decorator_deps_auth(dec)
+                            or router_authed or sig_authed) and not public:
                         sinks.append({"kind": "noauth", "loc": f"{rel}:{node.lineno}",
                                       "code": f"{route[0].upper()} {route[1]}  ({node.name})",
                                       "func": node.name, "route": route})
@@ -717,6 +891,8 @@ def run(ctx: Context) -> None:
     # User, Depends(get_current_user)]` in deps.py, used as a bare annotation in
     # every route module) before any file is judged for missing auth.
     files = list(_iter_py(source_path))
+    top_pkg = os.path.basename(source_path.rstrip("/" + os.sep))
+    parsed = []               # (module_key, tree) for router-graph resolution
     parse_failures = 0
     for path in files:
         try:
@@ -727,12 +903,15 @@ def run(ctx: Context) -> None:
         try:
             tree = ast.parse(src, filename=path)
             _collect_auth_aliases(tree, graph["auth_aliases"])
+            parsed.append((_module_key(os.path.relpath(path, source_path)), tree))
         except (SyntaxError, ValueError):
             # analyzer's Python can't parse this file (target may use a newer
             # Python) — recover auth aliases by text so we don't cascade into
             # false "no-auth" findings on every route that uses them.
             _collect_auth_aliases_text(src, graph["auth_aliases"])
             parse_failures += 1
+    # routers that inherit auth via composition (include_router(dependencies=...))
+    graph["protected_routers"] = _resolve_protected_routers(parsed, top_pkg)
     if parse_failures:
         ctx.note(f"{parse_failures} source file(s) did not parse on the analyzer's "
                  "Python; used text-fallback for auth aliases")
