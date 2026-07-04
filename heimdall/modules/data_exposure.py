@@ -205,10 +205,13 @@ def _value_leak(sval: str) -> str | None:
         if 13 <= len(digits) <= 19 and digits[0] in "3456" \
                 and len(set(digits)) > 1 and _luhn_ok(digits):
             return "credit-card number (Luhn-valid)"
-    # IBAN: country+check digits then a valid mod-97 checksum.
-    for m in _IBAN_RE.finditer(sval):
-        if _iban_ok(m.group()):
-            return "IBAN bank account (checksum-valid)"
+    # IBAN: country+check digits then a valid mod-97 checksum. IBANs are commonly
+    # written grouped in 4s with spaces, so validate a whitespace-stripped copy
+    # too (the mod-97 check keeps this near-zero-FP).
+    for candidate in {sval, re.sub(r"\s+", "", sval)}:
+        for m in _IBAN_RE.finditer(candidate):
+            if _iban_ok(m.group()):
+                return "IBAN bank account (checksum-valid)"
     if _SSN_RE.search(sval):
         return "US Social Security Number"
     return None
@@ -222,10 +225,18 @@ def _shannon(s: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in freq.values())
 
 
+# base64 magic prefixes of common binary FILES (image/pdf/zip/svg) — high entropy
+# but not secrets: PNG / JPEG / GIF / PDF / ZIP(docx…) / WEBP / SVG.
+_B64_FILE_MAGIC = ("iVBORw0KGgo", "/9j/", "R0lGOD", "JVBERi0", "UEsDBB", "UklGR", "PHN2Zw")
+
+
 def _entropy_secret(sval: str) -> bool:
     """A random-looking token/key with no known prefix. Gated to exclude the
     common benign high-entropy strings: UUIDs and single-case hex hashes are
-    ruled out by requiring MIXED character classes (upper+lower+digit)."""
+    ruled out by requiring MIXED character classes (upper+lower+digit); base64
+    file/image data is ruled out by its magic prefix."""
+    if sval.startswith(_B64_FILE_MAGIC):   # base64-encoded file/image, not a secret
+        return False
     if not _TOKENISH.match(sval) or _UUID_RE.match(sval):
         return False
     if not (any(c.isupper() for c in sval) and any(c.islower() for c in sval)

@@ -38,6 +38,21 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_data_exposure_iban_spaces_and_base64_magic():
+    """Space-formatted IBANs are caught (checksum-validated on a stripped copy);
+    base64 file/image data (magic prefix) is not a secret."""
+    from heimdall.modules import data_exposure as de
+
+    # FN fix: IBANs are commonly grouped with spaces
+    assert de._sensitive("note", "GB82 WEST 1234 5698 7654 32", False, set()) is not None
+    assert de._sensitive("iban", "GB82WEST12345698765432", False, set()) is not None  # contiguous still ok
+    # FP fix: base64-encoded binary files (PNG/JPEG magic) are not secrets
+    assert de._sensitive("thumb", "iVBORw0KGgoAAAANSUhEUg", False, set()) is None      # PNG
+    assert de._sensitive("img", "/9j/4AAQSkZJRgABAQEAYA", False, set()) is None         # JPEG
+    # a genuine entropy secret is unaffected
+    assert de._sensitive("api_key", "Xk9mQ2wL8pR4tY7nZ3vB", False, set()) is not None
+
+
 def test_data_exposure_token_expected_on_auth_route():
     """A token/JWT returned by a token-issuing auth route (login/refresh) is
     expected, not a leak; the same token on a normal route IS a leak, and a
