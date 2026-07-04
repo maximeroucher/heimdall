@@ -65,8 +65,8 @@ _FETCH_VERBS = ("get", "post", "put", "delete", "head", "patch", "request", "opt
 
 _PUBLIC_ROUTE = re.compile(
     r"login|logout|register|signup|sign-?up|/token|refresh|reset.?password|forgot|verif|"
-    r"validate[_-]?(email|account)|activate|confirm|webhook|callback|oauth|/health|/docs|"
-    r"openapi|\.well-known",
+    r"recover|password.?recovery|validate[_-]?(email|account)|activate|confirm|webhook|"
+    r"callback|oauth|/health|/docs|openapi|\.well-known",
     re.IGNORECASE)
 _CAP_TOKEN_PARAM = re.compile(r"\{[^}]*(token|code|secret|magic|invite|api[_-]?key)[^}]*\}",
                               re.IGNORECASE)
@@ -107,6 +107,26 @@ def _built_string(n: ast.AST | None) -> bool:
     return False
 
 
+_FILE_READ_TAILS = ("read_text", "read_bytes", "read", "get_data", "read_string")
+
+
+def _reads_file(value: ast.AST | None) -> bool:
+    """True if an assigned value is sourced from a filesystem read.
+
+    ``Template(x)`` where ``x`` came from ``Path(...).read_text()`` /
+    ``open(...).read()`` is a trusted template file, not user-controlled
+    template injection — the standard email/report rendering pattern.
+    """
+    if value is None:
+        return False
+    for sub in ast.walk(value):
+        if isinstance(sub, ast.Call):
+            tail = _callee(sub).split(".")[-1]
+            if tail in _FILE_READ_TAILS or tail == "open":
+                return True
+    return False
+
+
 def _kwarg(call: ast.Call, name: str):
     return next((k.value for k in call.keywords if k.arg == name), None)
 
@@ -127,10 +147,65 @@ def _depends_is_auth(dep_call: ast.Call) -> bool:
     return _auth_ish(name)
 
 
-def _handler_has_auth(fn: ast.AST) -> bool:
+def _collect_auth_aliases(tree: ast.AST, aliases: set) -> None:
+    """Record module-level ``NAME = Annotated[T, Depends(<auth>)]`` aliases.
+
+    This is the idiomatic FastAPI DI pattern (e.g. the official full-stack
+    template's ``CurrentUser = Annotated[User, Depends(get_current_user)]``).
+    A handler param annotated with such an alias IS authenticated even though
+    no ``Depends(...)`` appears in the handler's own signature.
+    """
+    for node in ast.walk(tree):
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign) else None)
+        val = getattr(node, "value", None)
+        if not targets or not isinstance(val, ast.Subscript):
+            continue
+        base = val.value
+        if not (isinstance(base, ast.Name) and base.id == "Annotated"):
+            continue
+        for sub in ast.walk(val):
+            if (isinstance(sub, ast.Call) and _callee(sub).split(".")[-1] == "Depends"
+                    and sub.args and _depends_is_auth(sub)):
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        aliases.add(t.id)
+                break
+
+
+# fallback when a file won't ``ast.parse`` (e.g. target uses a newer Python's
+# syntax than the analyzer): recover ``NAME = Annotated[..., Depends(auth)]``
+# aliases from raw text so their routes aren't falsely flagged as unauthenticated.
+_ALIAS_ANNOTATED_RE = re.compile(
+    r"^[ \t]*([A-Za-z_]\w*)[ \t]*(?::[^=\n]+)?=[ \t]*Annotated\[[^\n]*?"
+    r"Depends\([ \t]*([A-Za-z_][\w.]*)",
+    re.MULTILINE)
+
+
+def _collect_auth_aliases_text(src: str, aliases: set) -> None:
+    for m in _ALIAS_ANNOTATED_RE.finditer(src):
+        name, dep = m.group(1), m.group(2)
+        if _auth_ish(dep.split(".")[-1]):
+            aliases.add(name)
+
+
+def _handler_has_auth(fn: ast.AST, aliases: set | tuple = ()) -> bool:
     args = getattr(fn, "args", None)
     if args is None:
         return False
+    # param annotated with an auth-bearing alias, e.g. `current_user: CurrentUser`
+    if aliases:
+        params = (list(getattr(args, "posonlyargs", [])) + list(getattr(args, "args", []))
+                  + list(getattr(args, "kwonlyargs", [])))
+        for a in params:
+            ann = getattr(a, "annotation", None)
+            if isinstance(ann, ast.Name) and ann.id in aliases:
+                return True
+            # inline `Annotated[T, Depends(auth)]` on the param itself
+            if isinstance(ann, ast.Subscript):
+                base = ann.value
+                if isinstance(base, ast.Name) and base.id in aliases:
+                    return True
     for sub in ast.walk(args):
         if isinstance(sub, ast.Call) and _callee(sub).split(".")[-1] == "Depends" and sub.args:
             if _depends_is_auth(sub):
@@ -199,6 +274,17 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
     sinks = graph["sinks"]
     handlers = graph["handlers"]
     calls = graph["calls"]
+    aliases = graph.setdefault("auth_aliases", set())
+    _collect_auth_aliases(tree, aliases)  # also catch same-file alias defs
+
+    # per-function: local vars whose value is read from the filesystem
+    file_vars: dict[str | None, set] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _reads_file(node.value):
+            fn2 = enclosing_func(node)
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    file_vars.setdefault(fn2, set()).add(t.id)
 
     def snippet(node) -> str:
         i = node.lineno - 1
@@ -230,7 +316,9 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                 if isinstance(a0, (ast.Name, ast.BinOp, ast.JoinedStr, ast.Subscript)):
                     add("ssrf", node)
             elif tail in ("Template", "from_string", "render_template_string") and _dynamic(a0):
-                add("ssti", node)
+                # a template compiled from a file read on disk is trusted, not SSTI
+                if not (isinstance(a0, ast.Name) and a0.id in file_vars.get(fn, ())):
+                    add("ssti", node)
             elif tail in ("execute", "executemany", "executescript", "text", "raw") and _built_string(a0):
                 add("sqli", node)
             elif name in ("eval", "exec") and _dynamic(a0):
@@ -255,7 +343,7 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                 if route[0] in ("post", "put", "patch", "delete"):
                     public = (_PUBLIC_ROUTE.search(route[1]) or _PUBLIC_ROUTE.search(node.name)
                               or _CAP_TOKEN_PARAM.search(route[1]))
-                    if not (_handler_has_auth(node) or _decorator_deps_auth(dec)) and not public:
+                    if not (_handler_has_auth(node, aliases) or _decorator_deps_auth(dec)) and not public:
                         sinks.append({"kind": "noauth", "loc": f"{rel}:{node.lineno}",
                                       "code": f"{route[0].upper()} {route[1]}  ({node.name})",
                                       "func": node.name, "route": route})
@@ -403,7 +491,11 @@ def _confirm_noauth(ctx: Context, r, token=None):
         resp = ctx.request(r.method, path, json=body)  # NO credential
     except Exception:  # noqa: BLE001
         return "", ""
-    if resp.status_code not in (401, 403, 404, 405):
+    # Only a genuine success (2xx) proves an unauthenticated state change went
+    # through. A 4xx means the handler rejected the request (still no auth gate,
+    # but not a confirmed mutation) and a 5xx is an error, not a served request —
+    # neither should be reported as a LIVE-CONFIRMED no-auth exploit.
+    if 200 <= resp.status_code < 300:
         return "CONFIRMED", f"{r.method} {r.path} -> {resp.status_code} with no credential"
     return "", ""
 
@@ -619,9 +711,34 @@ def run(ctx: Context) -> None:
         ctx.note("no source path; static analysis skipped (black-box run)")
         return
 
-    graph = {"sinks": [], "handlers": {}, "calls": {}}
+    graph = {"sinks": [], "handlers": {}, "calls": {}, "auth_aliases": set()}
+
+    # pre-pass: collect cross-file auth aliases (e.g. `CurrentUser = Annotated[
+    # User, Depends(get_current_user)]` in deps.py, used as a bare annotation in
+    # every route module) before any file is judged for missing auth.
+    files = list(_iter_py(source_path))
+    parse_failures = 0
+    for path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        try:
+            tree = ast.parse(src, filename=path)
+            _collect_auth_aliases(tree, graph["auth_aliases"])
+        except (SyntaxError, ValueError):
+            # analyzer's Python can't parse this file (target may use a newer
+            # Python) — recover auth aliases by text so we don't cascade into
+            # false "no-auth" findings on every route that uses them.
+            _collect_auth_aliases_text(src, graph["auth_aliases"])
+            parse_failures += 1
+    if parse_failures:
+        ctx.note(f"{parse_failures} source file(s) did not parse on the analyzer's "
+                 "Python; used text-fallback for auth aliases")
+
     scanned = 0
-    for path in _iter_py(source_path):
+    for path in files:
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()

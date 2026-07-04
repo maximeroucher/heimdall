@@ -43,8 +43,14 @@ def run(ctx: Context) -> None:
     # outcome classify it. No verb/schema hint decides what to test — an endpoint
     # is a race target iff (a) a burst reaches it and (b) a sequential repeat is
     # then rejected (proving a consumable/limited invariant). Naming is irrelevant.
+    # DELETE is excluded: its "sequential repeat is rejected" signal is trivially
+    # true (the resource is simply gone), which confounds the limited/once
+    # classifier — duplicate concurrent success on a DELETE removes one row and
+    # returns success N times, with no double-spend/over-grant to exploit. Real
+    # TOCTOU races duplicate a VALUE (redeem/withdraw/mint), which lives on
+    # POST/PUT/PATCH.
     candidates = [r for r in ctx.routes
-                  if r.method in ("POST", "PUT", "PATCH", "DELETE") and len(r.path_params) <= 1]
+                  if r.method in ("POST", "PUT", "PATCH") and len(r.path_params) <= 1]
     if not candidates:
         ctx.note("no mutating endpoints to race")
         return

@@ -131,6 +131,92 @@ def test_sast_decorator_level_auth_suppresses_noauth(tmp_path):
     assert "noauth" not in hits
 
 
+def test_sast_annotated_alias_dep_suppresses_noauth(tmp_path):
+    """`current_user: CurrentUser` where CurrentUser = Annotated[User, Depends(...)]
+    is authenticated — the idiomatic FastAPI DI pattern (official template)."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "r.py").write_text(
+        "from typing import Annotated\n"
+        "from fastapi import APIRouter, Depends\n"
+        "CurrentUser = Annotated[object, Depends(get_current_user)]\n"
+        "router = APIRouter()\n"
+        "@router.delete('/items/{id}')\n"
+        "def delete_item(id, current_user: CurrentUser):\n"   # authed via alias
+        "    ...\n"
+        "@router.delete('/widgets/{id}')\n"
+        "def delete_widget(id):\n"                            # genuinely no auth
+        "    ...\n"
+    )
+    hits, _ = _sast_scan(sast, src)
+    noauth = [c for _, c in hits.get("noauth", [])]
+    assert not any("/items/{id}" in c for c in noauth)   # alias -> authed -> suppressed
+    assert any("/widgets/{id}" in c for c in noauth)     # no dep -> still flagged
+
+
+def test_sast_text_fallback_recovers_alias_from_unparseable():
+    """When a file won't ast.parse (target on a newer Python), auth aliases are
+    still recovered from raw text so routes aren't falsely flagged no-auth."""
+    from heimdall.modules import sast
+
+    # `except A, B:` is a SyntaxError on the analyzer's Python 3.12
+    src = (
+        "def get_current_user(session, token):\n"
+        "    try:\n"
+        "        payload = decode(token)\n"
+        "    except InvalidTokenError, ValidationError:\n"
+        "        raise\n"
+        "CurrentUser = Annotated[User, Depends(get_current_user)]\n"
+        "SessionDep = Annotated[Session, Depends(get_db)]\n"   # not auth -> ignored
+    )
+    import ast
+    try:
+        ast.parse(src)
+        assert False, "expected this source to be unparseable on py3.12"
+    except SyntaxError:
+        pass
+    aliases = set()
+    sast._collect_auth_aliases_text(src, aliases)
+    assert "CurrentUser" in aliases        # auth alias recovered by text
+    assert "SessionDep" not in aliases      # non-auth Depends not treated as auth
+
+
+def test_sast_ssti_file_read_template_not_flagged(tmp_path):
+    """Template compiled from a file read on disk is trusted, not SSTI; a template
+    built from a request value still is."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "email.py").write_text(
+        "from pathlib import Path\n"
+        "from jinja2 import Template\n"
+        "def render(name, context):\n"
+        "    template_str = (Path(__file__).parent / name).read_text()\n"
+        "    return Template(template_str).render(context)\n"       # trusted file
+        "def render_bad(user_supplied, context):\n"
+        "    return Template(user_supplied).render(context)\n"       # real SSTI
+    )
+    hits, _ = _sast_scan(sast, src)
+    ssti_codes = [c for _, c in hits.get("ssti", [])]
+    assert len(ssti_codes) == 1
+    assert any("user_supplied" in c for c in ssti_codes)
+
+
+def test_race_excludes_delete_from_candidates():
+    """DELETE is not a race target: its 'sequential repeat rejected' signal is
+    trivially true (resource gone) and duplicate-delete has no double-spend."""
+    import inspect
+
+    from heimdall.modules import race_conditions
+    src = inspect.getsource(race_conditions.run)
+    # the candidate verb tuple must not include DELETE
+    assert '"POST", "PUT", "PATCH"' in src
+    assert '"DELETE"' not in src.split("candidates = [")[1].split("]")[0]
+
+
 def test_sast_callgraph_resolves_sink_to_handler_route(tmp_path):
     from heimdall.modules import sast
 
