@@ -67,9 +67,15 @@ _HTTP_FETCH_ROOTS = ("requests.", "httpx.", "aiohttp.")
 _FETCH_VERBS = ("get", "post", "put", "delete", "head", "patch", "request", "options")
 
 _PUBLIC_ROUTE = re.compile(
-    r"login|logout|register|signup|sign-?up|/token|refresh|reset.?password|forgot|verif|"
-    r"recover|password.?recovery|validate[_-]?(email|account)|activate|confirm|webhook|"
-    r"callback|oauth|/health|/docs|openapi|\.well-known",
+    # auth/account-lifecycle endpoints are unauthenticated BY DESIGN across apps:
+    # login/token/session, registration, and password/confirmation flows. A
+    # narrow list mis-flags every one of them as "missing auth".
+    r"login|logout|log-?in|sign-?in|signin|\bauth\b|authenticate|auth[_-]?token|"
+    r"access[_-]?token|/token|refresh|session|register|signup|sign-?up|"
+    r"create[_-]?user|create[_-]?account|user[_-]?create|new[_-]?account|"
+    r"password|passwd|reset.?password|forgot|recover|password.?recovery|verif|"
+    r"validate[_-]?(email|account)|activate|confirm|resend|magic[_-]?link|otp|"
+    r"webhook|callback|oauth|/health|/docs|openapi|\.well-known",
     re.IGNORECASE)
 _CAP_TOKEN_PARAM = re.compile(r"\{[^}]*(token|code|secret|magic|invite|api[_-]?key)[^}]*\}",
                               re.IGNORECASE)
@@ -992,7 +998,20 @@ def run(ctx: Context) -> None:
             verdict, chain_ev = _chain(ctx, kind, uniq, handlers, calls, token)
 
         if verdict == "CONFIRMED":
-            sev = _ELEVATE.get(kind, sev)
+            if kind == "noauth":
+                # Elevate to HIGH only when the unauth mutation touches an EXISTING
+                # resource — a path id, or PUT/PATCH/DELETE. An anonymous create on
+                # a bare collection (POST /secret_message, /contact, /feedback) is
+                # commonly a legitimate public feature, not broken access control;
+                # keep it at the base severity (a "confirm this is intended" lead).
+                resource_targeting = any(
+                    "{" in (s.get("route") or ("", ""))[1]
+                    or (s.get("route") or ("",))[0] in ("put", "patch", "delete")
+                    for s in uniq)
+                if resource_targeting:
+                    sev = _ELEVATE["noauth"]
+            else:
+                sev = _ELEVATE.get(kind, sev)
             title = f"CONFIRMED (live) — {title}"
         elif verdict == "GATED":
             title = f"{title} — reachable but role-gated"

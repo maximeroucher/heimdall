@@ -345,6 +345,35 @@ def test_sast_skips_migration_dirs(tmp_path):
     assert scanned == []                 # whole revisions subtree skipped
 
 
+def test_sast_public_auth_account_routes_suppressed(tmp_path):
+    """Auth/account-lifecycle endpoints (login/token/session, registration,
+    password flows) are unauthenticated by design — not missing-auth findings."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "r.py").write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n"
+        "@router.post('/auth')\n"
+        "def auth_cookie_session_user(body): ...\n"              # login
+        "@router.post('/users/auth')\n"
+        "def get_user_auth_token(body): ...\n"                   # token
+        "@router.post('')\n"
+        "def create_user(body): ...\n"                           # registration
+        "@router.post('/passwords/request-change')\n"
+        "def request_change_user_password(body): ...\n"          # password flow
+        "@router.delete('/widgets/{id}')\n"
+        "def delete_widget(id): ...\n"                           # genuinely no auth
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    noauth = [c for _, c in hits.get("noauth", [])]
+    assert not any("/auth" in c for c in noauth)
+    assert not any("create_user" in c for c in noauth)
+    assert not any("request-change" in c for c in noauth)
+    assert any("/widgets/{id}" in c for c in noauth)            # still flagged
+
+
 def test_sast_flags_state_changing_get(tmp_path):
     """A GET/HEAD handler that performs a DB mutation (delete/commit) is a
     state-changing safe-method route — CSRF-able; read-only GETs are not."""
