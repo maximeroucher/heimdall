@@ -51,6 +51,57 @@ def test_data_exposure_token_expected_on_auth_route():
     assert de._sensitive("access_token", "Summer2024!", True, {"Summer2024!"}) is not None
 
 
+def test_detect_db_kind():
+    """The DB engine is detected from the driver package or a connection URL, so
+    Heimdall can spawn the matching throwaway on its own."""
+    import tempfile
+    from pathlib import Path
+
+    from heimdall.discovery.source import detect_db_kind
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for sub, imp, expect in [("m", "from pymongo import MongoClient", "mongo"),
+                                 ("p", "import asyncpg", "postgres"),
+                                 ("y", "import pymysql", "mysql"),
+                                 ("s", "import sqlite3", "sqlite")]:
+            (root / sub).mkdir()
+            (root / sub / "a.py").write_text(imp + "\n")
+            assert detect_db_kind(str(root / sub)) == expect, sub
+    # an explicit connection URL's driver wins
+    assert detect_db_kind(None, "postgresql+asyncpg://u:p@h/db") == "postgres"
+    assert detect_db_kind(None, "mongodb+srv://h/db") == "mongo"
+    assert detect_db_kind(None, "mysql://u:p@h/db") == "mysql"
+
+
+def test_detect_db_env_vars_and_build_launch_env():
+    """Env-var names the app reads are detected and populated with the throwaway
+    DB's real coordinates (not a guessed single URL name)."""
+    import tempfile
+    from pathlib import Path
+
+    from heimdall.bootstrap.testdb import _DOCKER_DB, _build_launch_env
+    from heimdall.discovery.source import detect_db_env_vars
+
+    with tempfile.TemporaryDirectory() as d:
+        app = Path(d) / "app"
+        app.mkdir()
+        (app / "db.py").write_text(
+            "from os import getenv\n"
+            "getenv('MONGO_HOST'); getenv('MONGO_PORT'); getenv('MONGO_USERNAME')\n"
+            "getenv('MONGO_PASSWORD'); getenv('MONGO_DATABASE')\n")
+        ev = detect_db_env_vars(str(app))
+    assert {"MONGO_HOST", "MONGO_PORT", "MONGO_USERNAME", "MONGO_PASSWORD",
+            "MONGO_DATABASE"} <= ev
+    env = _build_launch_env("mongo", "127.0.0.1", 5555, _DOCKER_DB["mongo"],
+                            "mongodb://heimdall:heimdall@127.0.0.1:5555/?authSource=admin",
+                            "DATABASE_URL", ev)
+    assert env["MONGO_HOST"] == "127.0.0.1" and env["MONGO_PORT"] == "5555"
+    assert env["MONGO_USERNAME"] == "heimdall" and env["MONGO_PASSWORD"] == "heimdall"
+    assert env["MONGO_DATABASE"] == "heimdall"
+    assert env["MONGO_URL"].endswith("authSource=admin")
+
+
 def test_looks_like_id_param():
     assert looks_like_id_param("user_id")
     assert looks_like_id_param("id")

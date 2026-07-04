@@ -24,14 +24,20 @@ from pathlib import Path
 
 @dataclass
 class TestDB:
-    kind: str                        # "sqlite" | "postgres" | "mysql"
-    path: str                        # sqlite file path OR the throwaway db name
-    connect_url: str                 # SQLAlchemy URL Heimdall connects with (sync)
+    kind: str                        # "sqlite" | "postgres" | "mysql" | "mongo"
+    path: str                        # sqlite file path OR db name OR container name
+    connect_url: str                 # URL Heimdall connects with (sync for SQL)
     launch_env: dict = field(default_factory=dict)   # env the target launches with
     launch_cwd: str | None = None
     server_url: str | None = None    # admin URL for dropping a server-side db
+    container: str | None = None     # docker container name (spawned server), if any
 
     def remove(self) -> None:
+        if self.container:           # a throwaway docker DB server we spawned
+            import subprocess
+            subprocess.run(["docker", "rm", "-f", self.container],
+                           capture_output=True, text=True)
+            return
         if self.kind == "sqlite":
             for suffix in ("", "-wal", "-shm", "-journal"):
                 try:
@@ -57,6 +63,151 @@ def spawn(launch_cwd: str, *, source_db_url: str | None = None,
     if driver in ("mysql", "mariadb"):
         return spawn_server_db(source_db_url, kind="mysql")
     return spawn_sqlite(launch_cwd, name=sqlite_name, env_var=sqlite_env_var)
+
+
+def spawn_auto(launch_cwd: str, *, source_path: str | None = None,
+               db_url: str | None = None, sqlite_name: str = "heimdall_testdb.sqlite",
+               sqlite_env_var: str = "SQLITE_DB") -> TestDB:
+    """Detect the target's DB engine and provide a matching throwaway ON ITS OWN:
+
+    * an explicit ``--db-url`` (a reachable server you already run) → a fresh
+      throwaway database on it (Postgres/MySQL),
+    * otherwise a server engine (Postgres / MySQL / Mongo) → spin up a throwaway
+      Docker container of that engine and tear it down afterwards,
+    * SQLite → a throwaway file.
+    """
+    from ..discovery.source import detect_db_kind, detect_db_url
+    src_url = db_url
+    if not src_url and source_path:
+        src_url = detect_db_url(source_path)
+    kind = detect_db_kind(source_path, src_url)
+    # a caller-supplied server URL means "use this running server"
+    if db_url and (kind in ("postgres", "mysql")):
+        return spawn_server_db(db_url, kind=kind)
+    if kind in ("postgres", "mysql", "mongo"):
+        return spawn_docker_db(kind, source_path=source_path, env_var=sqlite_env_var)
+    return spawn_sqlite(launch_cwd, name=sqlite_name, env_var=sqlite_env_var)
+
+
+# ── Docker-spawned throwaway DB servers (Postgres / MySQL / Mongo) ────────────
+_DOCKER_DB = {
+    "postgres": {
+        "image": "postgres:16-alpine", "port": 5432,
+        "env": {"POSTGRES_USER": "heimdall", "POSTGRES_PASSWORD": "heimdall",
+                "POSTGRES_DB": "heimdall"},
+        "ready": ["pg_isready", "-U", "heimdall", "-d", "heimdall"],
+        "url": "postgresql://heimdall:heimdall@127.0.0.1:{port}/heimdall",
+        "user": "heimdall", "password": "heimdall", "dbname": "heimdall",
+    },
+    "mysql": {
+        "image": "mysql:8", "port": 3306,
+        "env": {"MYSQL_ROOT_PASSWORD": "heimdall", "MYSQL_DATABASE": "heimdall",
+                "MYSQL_USER": "heimdall", "MYSQL_PASSWORD": "heimdall"},
+        "ready": ["mysqladmin", "ping", "-h", "localhost", "-uroot", "-pheimdall", "--silent"],
+        "url": "mysql://root:heimdall@127.0.0.1:{port}/heimdall",
+        "user": "root", "password": "heimdall", "dbname": "heimdall",
+    },
+    "mongo": {
+        "image": "mongo:7", "port": 27017,
+        "env": {"MONGO_INITDB_ROOT_USERNAME": "heimdall", "MONGO_INITDB_ROOT_PASSWORD": "heimdall"},
+        "ready": ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"],
+        "url": "mongodb://heimdall:heimdall@127.0.0.1:{port}/?authSource=admin",
+        "user": "heimdall", "password": "heimdall", "dbname": "heimdall",
+    },
+}
+
+
+def _docker_available() -> bool:
+    import subprocess
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True,
+                              timeout=15).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _docker_host_port(name: str, container_port: int) -> int:
+    import subprocess
+    out = subprocess.check_output(["docker", "port", name, f"{container_port}/tcp"],
+                                  text=True).strip().splitlines()
+    # e.g. "127.0.0.1:54321" (may list IPv4 + IPv6)
+    for line in out:
+        hostport = line.rsplit(":", 1)[-1].strip()
+        if hostport.isdigit():
+            return int(hostport)
+    raise RuntimeError(f"could not read mapped port for {name}")
+
+
+def _wait_docker_ready(name: str, spec: dict, timeout: float = 75.0) -> None:
+    import subprocess
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        r = subprocess.run(["docker", "exec", name, *spec["ready"]],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        time.sleep(1.5)
+    raise RuntimeError(f"throwaway {name} did not become ready within {timeout:.0f}s")
+
+
+def spawn_docker_db(kind: str, *, source_path: str | None = None,
+                    env_var: str = "DATABASE_URL") -> TestDB:
+    """Spin up a throwaway Docker DB server of ``kind`` and return a TestDB whose
+    launch_env carries exactly the connection env the target reads."""
+    import subprocess
+    import uuid as _uuid
+    if kind not in _DOCKER_DB:
+        raise ValueError(f"no docker recipe for DB kind {kind!r}")
+    if not _docker_available():
+        raise RuntimeError("Docker is not available to spawn a throwaway DB server "
+                           "(start Docker, or pass --db-url to use an existing server)")
+    spec = _DOCKER_DB[kind]
+    name = f"heimdall-db-{_uuid.uuid4().hex[:10]}"
+    args = ["docker", "run", "-d", "--name", name, "-p", f"127.0.0.1::{spec['port']}"]
+    for k, v in spec["env"].items():
+        args += ["-e", f"{k}={v}"]
+    args += [spec["image"]]
+    subprocess.run(args, check=True, capture_output=True, text=True)
+    try:
+        port = _docker_host_port(name, spec["port"])
+        _wait_docker_ready(name, spec)
+    except Exception:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+        raise
+    url = spec["url"].format(port=port)
+    from ..discovery.source import detect_db_env_vars
+    env_vars = detect_db_env_vars(source_path) if source_path else set()
+    launch_env = _build_launch_env(kind, "127.0.0.1", port, spec, url, env_var, env_vars)
+    return TestDB(kind=kind, path=name, connect_url=url, launch_env=launch_env, container=name)
+
+
+def _build_launch_env(kind: str, host: str, port: int, spec: dict, url: str,
+                      env_var: str, env_vars: set) -> dict:
+    """Populate every DB env var the app reads (detected from source) with the
+    throwaway's coordinates, plus the standard URL name(s) as a fallback."""
+    env: dict = {}
+    if kind == "mongo":
+        for v in ("MONGO_URL", "MONGODB_URI", "MONGO_URI", "MONGODB_URL"):
+            env[v] = url
+    else:
+        env[env_var or "DATABASE_URL"] = url
+        env["DATABASE_URL"] = url
+    for name in env_vars:
+        u = name.upper()
+        if "URL" in u or "URI" in u or "DSN" in u:
+            env[name] = url
+        elif "HOST" in u or "SERVER" in u:
+            env[name] = host
+        elif "PORT" in u:
+            env[name] = str(port)
+        elif "USER" in u:            # USER / USERNAME
+            env[name] = spec["user"]
+        elif "PASS" in u:            # PASS / PASSWORD
+            env[name] = spec["password"]
+        elif "NAME" in u or "DATABASE" in u or u.endswith("_DB") or u == "DB":
+            env[name] = spec["dbname"]
+    return env
 
 
 # ── SQLite ────────────────────────────────────────────────────────────────────

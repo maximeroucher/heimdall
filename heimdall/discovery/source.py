@@ -110,6 +110,115 @@ def detect_db_url(source_path: str, secrets: list[Secret] | None = None) -> str 
     return None
 
 
+# driver / client packages (and their giveaway symbols) per engine — so we can
+# detect the DB kind even when there is no explicit DATABASE_URL to parse.
+_DB_DRIVER_HINTS = {
+    "mongo": ("pymongo", "motor", "mongoengine", "beanie", "mongomock", "umongo",
+              "mongoclient", "asynciomotorclient", "mongodb"),
+    "postgres": ("psycopg2", "psycopg", "asyncpg", "postgresql", "postgres", "pg8000"),
+    "mysql": ("pymysql", "mysqlclient", "aiomysql", "mysqldb", "mariadb", "asyncmy",
+              "mysql-connector", "mysql+"),
+    "sqlite": ("aiosqlite", "sqlite3", "sqlite:"),
+}
+_URLISH_DRIVERS = {
+    "postgresql": "postgres", "postgres": "postgres", "psql": "postgres",
+    "mysql": "mysql", "mariadb": "mysql", "sqlite": "sqlite",
+    "mongodb": "mongo", "mongodb+srv": "mongo",
+}
+_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "site-packages",
+              ".tox", "dist", "build", ".mypy_cache", "tests"}
+
+
+def _dep_blob(source_path: str) -> str:
+    """Requirements / pyproject text plus a sampling of import lines — enough to
+    tell which DB driver the app pulls in, without importing anything."""
+    root = Path(source_path)
+    parts: list[str] = []
+    # dependency manifests live at or above the source dir (e.g. src/app -> repo)
+    for base in (root, root.parent, root.parent.parent):
+        for fname in ("requirements.txt", "requirements.in", "pyproject.toml",
+                      "poetry.lock", "Pipfile", "setup.cfg", "setup.py", "uv.lock"):
+            fp = base / fname
+            if fp.is_file():
+                try:
+                    parts.append(fp.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
+    n = 0
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in _SKIP_DIRS and not d.startswith(".")]
+        for f in fn:
+            if f.endswith(".py"):
+                try:
+                    with open(os.path.join(dp, f), encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            s = line.lstrip()
+                            if s.startswith(("import ", "from ")) or "://" in line:
+                                parts.append(line)
+                except OSError:
+                    pass
+                n += 1
+                if n >= 800:
+                    return "\n".join(parts)
+    return "\n".join(parts)
+
+
+def detect_db_kind(source_path: str | None, db_url: str | None = None) -> str | None:
+    """The database ENGINE the target uses — "mongo" | "postgres" | "mysql" |
+    "sqlite" — so Heimdall can spawn a matching throwaway server on its own.
+    Prefers an explicit connection URL's driver, else the DB client package the
+    app depends on / imports."""
+    if db_url and "://" in db_url:
+        drv = db_url.split("://", 1)[0].split("+", 1)[0].lower()
+        if drv in _URLISH_DRIVERS:
+            return _URLISH_DRIVERS[drv]
+    if not source_path or not Path(source_path).exists():
+        return None
+    blob = _dep_blob(source_path).lower()
+    scores = {kind: sum(blob.count(h) for h in hints)
+              for kind, hints in _DB_DRIVER_HINTS.items()}
+    # SQLite ships with Python and is often an incidental import; only pick it if
+    # no server DB driver is present.
+    server = {k: v for k, v in scores.items() if k != "sqlite"}
+    if any(server.values()):
+        return max(server, key=server.get)
+    return "sqlite" if scores["sqlite"] else None
+
+
+_DB_ENV_RE = re.compile(
+    r"""(?:getenv|environ\.get)\(\s*["']([A-Z][A-Z0-9_]*)["']"""
+    r"""|environ\[\s*["']([A-Z][A-Z0-9_]*)["']\s*\]""")
+
+
+def detect_db_env_vars(source_path: str | None) -> set[str]:
+    """Env-var names the app reads that look DB-related (MONGO_HOST, DATABASE_URL,
+    POSTGRES_PORT, …) — so a spawned throwaway can populate exactly what the app
+    expects, not just a guessed name."""
+    if not source_path or not Path(source_path).exists():
+        return set()
+    out: set[str] = set()
+    kw = ("MONGO", "DATABASE", "POSTGRES", "PG", "MYSQL", "MARIADB", "DB_", "_DB",
+          "SQL", "REDIS")
+    n = 0
+    for dp, dn, fn in os.walk(source_path):
+        dn[:] = [d for d in dn if d not in _SKIP_DIRS and not d.startswith(".")]
+        for f in fn:
+            if not f.endswith(".py"):
+                continue
+            try:
+                txt = open(os.path.join(dp, f), encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            for m in _DB_ENV_RE.finditer(txt):
+                name = m.group(1) or m.group(2)
+                if name and any(k in name for k in kw):
+                    out.add(name)
+            n += 1
+            if n >= 800:
+                return out
+    return out
+
+
 _CLIENTS_KEY = re.compile(r"^(auth_clients|oauth_clients|clients)\s*:\s*$", re.I)
 
 

@@ -37,7 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--launch", help="shell command to boot the target first")
     ap.add_argument("--launch-cwd", help="cwd for --launch")
     ap.add_argument("--spawn-db", action="store_true",
-                    help="spawn a throwaway sqlite DB for the target (needs --launch-cwd)")
+                    help="detect the target's DB engine and spawn a matching throwaway on "
+                         "its own — a Docker Postgres/MySQL/Mongo server (torn down after) or "
+                         "a SQLite file (needs --launch-cwd; Docker for server engines)")
     ap.add_argument("--spawn-db-env", default="SQLITE_DB",
                     help="env var the target reads for the DB (default SQLITE_DB)")
     ap.add_argument("--db-url", help="throwaway DB SQLAlchemy URL to provision into "

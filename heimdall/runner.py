@@ -65,20 +65,19 @@ def run(
         from .bootstrap import testdb as testdb_mod
         if not config.launch_cwd:
             raise SystemExit("[!] spawn_db requires launch_cwd")
-        # Auto-detect the app's DB kind from its config so we spawn the right
-        # throwaway (a Postgres/MySQL database, or a SQLite file).
-        source_db = config.db_url
-        if not source_db and config.source_path:
-            from .discovery.source import detect_db_url
-            source_db = detect_db_url(config.source_path)
-        testdb = testdb_mod.spawn(
-            config.launch_cwd, source_db_url=source_db,
+        # Auto-detect the app's DB ENGINE from its source and provide a matching
+        # throwaway on our own: a Docker Postgres/MySQL/Mongo server (torn down
+        # after), a fresh database on a --db-url server, or a SQLite file.
+        testdb = testdb_mod.spawn_auto(
+            config.launch_cwd, source_path=config.source_path, db_url=config.db_url,
             sqlite_name=config.spawn_db_name, sqlite_env_var=config.spawn_db_env_var)
         launch_env.update(testdb.launch_env)
         db_url = testdb.connect_url
-        print(term.info(f"spawned throwaway {term.bold(testdb.kind)} DB: {testdb.path}"))
-        if testdb.kind != "sqlite":
-            print(term.info(f"target will launch with DATABASE_URL → …/{testdb.path}"))
+        detail = (f"docker {testdb.container}" if testdb.container else testdb.path)
+        print(term.info(f"spawned throwaway {term.bold(testdb.kind)} DB: {detail}"))
+        if testdb.launch_env:
+            print(term.info("target will launch with: "
+                            + ", ".join(sorted(testdb.launch_env))))
 
     proc = None
     if config.launch:
