@@ -57,12 +57,20 @@ _PS_CMDI = "https://portswigger.net/web-security/os-command-injection"
 _PS_SSRF = "https://portswigger.net/web-security/ssrf"
 _PS_SSTI = "https://portswigger.net/web-security/server-side-template-injection"
 
-_AUTH_HINTS = (
-    "current_user", "current_active_user", "get_current", "rolesbasedauthchecker",
-    "rolechecker", "require_", "has_permission", "has_role", "get_api_key",
-    "oauth2_scheme", "verify_token", "verify_jwt", "authenticate", "auth_required",
-    "get_user", "login_required", "permission", "authorizer",
-)
+# Recognise the callable name of an auth dependency across real-world naming.
+# Precise (regex, not substring) so it matches user_api_key_auth / require_auth /
+# verify_jwt / authorize etc. WITHOUT the classic false friend `author`
+# (`[_-]auth\b` and `\bauth\b` need a word boundary, which "author"/"authors"
+# lack — the char after "auth" there is a word char).
+_AUTH_NAME_RE = re.compile(
+    r"current[_-]?user|current[_-]?active|get[_-]?current|roles?[_-]?based|role[_-]?checker|"
+    r"require[_-]|has[_-]?permission|has[_-]?role|api[_-]?key|apikey|oauth2?[_-]?scheme|"
+    r"verify[_-]?(token|jwt|auth|api|key|session)|authenticat|"
+    r"auth[_-]?(required|guard|user|dep|dependency|scheme|token|check|middleware|backend|context)|"
+    r"[_-]auth\b|\bauth\b|authoriz|login[_-]?required|logged[_-]?in|permission|authorizer|"
+    r"\bbearer|security[_-]?scopes?|jwt[_-]?bearer|access[_-]?control|"
+    r"check[_-]?(auth|permission|token|access|scope)|ensure[_-]?(auth|user|login)",
+    re.IGNORECASE)
 _HTTP_FETCH_ROOTS = ("requests.", "httpx.", "aiohttp.")
 _FETCH_VERBS = ("get", "post", "put", "delete", "head", "patch", "request", "options")
 
@@ -75,11 +83,16 @@ _PUBLIC_ROUTE = re.compile(
     r"create[_-]?user|create[_-]?account|user[_-]?create|new[_-]?account|"
     r"password|passwd|reset.?password|forgot|recover|password.?recovery|verif|"
     r"validate[_-]?(email|account)|activate|confirm|resend|magic[_-]?link|otp|"
+    r"onboarding|invitation|\binvite\b|accept[_-]?invite|"
     r"webhook|callback|oauth|/health|/docs|openapi|\.well-known",
     re.IGNORECASE)
 _CAP_TOKEN_PARAM = re.compile(r"\{[^}]*(token|code|secret|magic|invite|api[_-]?key)[^}]*\}",
                               re.IGNORECASE)
 _COMMENTED_DEPENDS = re.compile(r"#[^\n]*\bDepends\s*\(\s*[A-Za-z_]")
+# a commented-out route decorator or function def — signals the whole endpoint
+# is dead/removed code (so a commented auth line inside it is not "disabled auth")
+_COMMENTED_ENDPOINT = re.compile(
+    r"#\s*(async\s+)?def\s|#\s*@[\w.]+\.(get|post|put|patch|delete|route|api_route|websocket)\b")
 _AUTH_WORD = re.compile(
     r"auth|role|permission|current[_ ]?user|require|oauth|jwt|api[_ ]?key|login|verif",
     re.IGNORECASE)
@@ -174,8 +187,7 @@ def _arg0(call: ast.Call):
 
 
 def _auth_ish(name: str) -> bool:
-    low = name.lower()
-    return any(h in low for h in _AUTH_HINTS)
+    return bool(_AUTH_NAME_RE.search(name))
 
 
 def _depends_is_auth(dep_call: ast.Call) -> bool:
@@ -399,19 +411,30 @@ def _route_decorator(dec: ast.AST):
 
 # ORM/DB write calls — a GET/HEAD handler that runs one is changing state over a
 # safe/idempotent HTTP method: CSRF-able (<img src>, link prefetch), cacheable,
-# and logged in URLs. `commit`/`flush` alone are conclusive (reads never commit).
-_DB_MUTATORS = frozenset({
-    "commit", "flush", "delete", "add", "add_all", "merge", "save", "remove",
-    "bulk_save_objects", "bulk_insert_mappings", "bulk_update_mappings", "destroy",
+# and logged in URLs. `commit`/`flush`/`bulk_*` are conclusive DB writes (reads
+# never commit). The generic verbs (add/remove/save/…) are ambiguous — `set.add`,
+# `list.remove`, `dict.update` are common in READ handlers — so they only count
+# when the receiver looks like a DB session/repository, not an arbitrary object.
+_DB_STRONG = frozenset({
+    "commit", "flush", "bulk_save_objects", "bulk_insert_mappings", "bulk_update_mappings",
 })
+_DB_WRITE = frozenset({"delete", "add", "add_all", "merge", "save", "remove", "insert", "destroy"})
+_DB_RECV = re.compile(
+    r"(db|session|sess|conn|connection|cursor|engine|tx|txn|trans|store|repo|repository|"
+    r"table|orm|prisma|client|backend|dao)s?$", re.IGNORECASE)
 
 
 def _mutates_state(fn: ast.AST) -> bool:
     for node in ast.walk(fn):
-        if isinstance(node, ast.Call):
-            tail = _callee(node).split(".")[-1]
-            if tail in _DB_MUTATORS:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            tail = node.func.attr
+            if tail in _DB_STRONG:
                 return True
+            if tail in _DB_WRITE:
+                recv = node.func.value
+                recv_name = recv.id if isinstance(recv, ast.Name) else getattr(recv, "attr", "")
+                if _DB_RECV.search(recv_name):
+                    return True
     return False
 
 
@@ -554,8 +577,13 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
 
     for i, line in enumerate(lines, 1):
         if _COMMENTED_DEPENDS.search(line) and _AUTH_WORD.search(line):
-            sinks.append({"kind": "commented_auth", "loc": f"{rel}:{i}",
-                          "code": line.strip(), "func": None})
+            # Only a concern if the endpoint is LIVE with its auth line removed.
+            # If the route decorator or the `def` itself is ALSO commented out
+            # nearby, the whole endpoint is dead/removed code — not disabled auth.
+            window = lines[max(0, i - 9):i + 2]
+            if not any(_COMMENTED_ENDPOINT.search(w) for w in window):
+                sinks.append({"kind": "commented_auth", "loc": f"{rel}:{i}",
+                              "code": line.strip(), "func": None})
         if _HEADER_LEAK.search(line):
             sinks.append({"kind": "header_leak", "loc": f"{rel}:{i}",
                           "code": line.strip(), "func": None})

@@ -392,13 +392,18 @@ def test_sast_flags_state_changing_get(tmp_path):
         "@router.get('/books/{id}')\n"
         "def read_book(id, db):\n"
         "    return db.query(Book).get(id)\n"         # read-only GET
+        "@router.get('/metrics')\n"
+        "def metrics():\n"
+        "    seen = set()\n"
+        "    seen.add(1)\n"                           # set.add -> NOT a DB write
+        "    return list(seen)\n"
         "@router.get('/new')\n"
         "def new_form(request):\n"
         "    return render('form.html')\n"            # pure render
     )
     hits, _ = _sast_full_scan(sast, src)
     codes = [c for _, c in hits.get("state_change_get", [])]
-    assert len(codes) == 1
+    assert len(codes) == 1                            # only the real DB mutation
     assert "/books/{id}/delete" in codes[0]
 
 
