@@ -38,6 +38,26 @@ def test_data_exposure_skips_schema_metadata_fields():
     assert de._sensitive("api_key", secretish, False, set()) is not None
 
 
+def test_improper_inventory_config_json_needs_real_secret_value():
+    """The config.json probe must require a secret-ish key with a substantive
+    value — a public SPA config with null/empty/placeholder values is not a leak,
+    and secret_key / API_KEY / JWT values must be caught (the old exact-word
+    regex missed them)."""
+    from heimdall.modules.improper_inventory import _PROBES
+
+    sig = next(s for p, s, _sev, _l in _PROBES if p == "config.json")
+    # real leaks flag
+    assert sig.search('{"database":{"password":"S3cr3tP@ssw0rd!"}}')
+    assert sig.search('{"secret_key":"sk_live_abc123def456ghi789"}')
+    assert sig.search('{"API_KEY": "AIzaSyD-abc123def456ghi"}')
+    assert sig.search('{"token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"}')
+    # public / empty / placeholder configs stay quiet
+    assert not sig.search('{"token": null, "apiUrl":"/api"}')
+    assert not sig.search('{"key": "", "feature": true}')
+    assert not sig.search('{"password": "CHANGEME"}')
+    assert not sig.search('{"apiUrl":"https://api.example.com","timeout":30}')
+
+
 def test_csrf_reads_samesite_of_the_session_cookie():
     """When a login sets several cookies, the CSRF verdict must reflect the SameSite
     of the auth cookie, not whichever SameSite appears first in the header."""

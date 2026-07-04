@@ -31,7 +31,10 @@ _PROBES = [
     (".env", re.compile(r"(?m)^[A-Z][A-Z0-9_]{2,}\s*="), "HIGH", "Environment file (secrets)"),
     (".env.local", re.compile(r"(?m)^[A-Z][A-Z0-9_]{2,}\s*="), "HIGH", "Environment file"),
     (".env.production", re.compile(r"(?m)^[A-Z][A-Z0-9_]{2,}\s*="), "HIGH", "Environment file"),
-    ("config.json", re.compile(r"[\"'](secret|password|token|key)[\"']\s*:"), "HIGH", "Config with secrets"),
+    ("config.json", re.compile(
+        r"""["'](?:password|secret|secret[_-]?key|access[_-]?key|api[_-]?key|"""
+        r"""private[_-]?key|client[_-]?secret|token|auth[_-]?token)["']\s*:\s*"""
+        r"""["'][^"']{12,}["']""", re.I), "HIGH", "Config with secrets"),
     (".aws/credentials", re.compile(r"aws_access_key_id", re.I), "HIGH", "AWS credentials"),
     ("actuator/env", re.compile(r"propertySources|systemProperties"), "HIGH", "Spring actuator env"),
     ("actuator", re.compile(r"\"_links\"|/actuator/health"), "MEDIUM", "Spring actuator index"),
