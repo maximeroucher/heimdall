@@ -34,3 +34,18 @@ def test_public_by_design():
     assert a01._is_public_by_design("/core/auth/login", "login")
     assert a01._is_public_by_design("/openapi.json", "")
     assert not a01._is_public_by_design("/users/", "list_users")
+
+
+def test_materially_differ_discriminates_boolean_sqli():
+    from heimdall.modules import a03_injection as a03
+
+    class R:
+        def __init__(self, status, text):
+            self.status_code, self.text = status, text
+
+    # reflection: TRUE/FALSE payloads differ by one char -> bodies ~equal -> NOT material
+    assert a03._materially_differ(R(200, "x" * 500), R(200, "x" * 501)) is False
+    # boolean SQLi: TRUE dumps rows, FALSE empty -> large delta -> material
+    assert a03._materially_differ(R(200, "x" * 9000), R(200, "x" * 12)) is True
+    # a status-class change is also material
+    assert a03._materially_differ(R(200, "ok"), R(500, "ok")) is True
