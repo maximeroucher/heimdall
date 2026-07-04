@@ -572,6 +572,58 @@ def test_sast_sql_fstring_trusted_interpolation(tmp_path):
     assert "WHERE n" in sqli[0]
 
 
+def test_sast_decorator_auth_login_required(tmp_path):
+    """Flask-Login / Starlette-style auth decorators (@login_required,
+    @roles_required, @requires) guard a route even with no Depends in the sig."""
+    from heimdall.modules import sast
+
+    src = tmp_path / "app"
+    src.mkdir()
+    (src / "r.py").write_text(
+        "from fastapi import FastAPI, Request\n"
+        "app = FastAPI()\n"
+        "@app.post('/items')\n"
+        "@login_required\n"
+        "def create(request): ...\n"                 # decorator auth
+        "@app.delete('/w/{id}')\n"
+        "@roles_required('admin')\n"
+        "def rm(request, id): ...\n"                  # decorator auth
+        "@app.post('/open')\n"
+        "def open_ep(body): ...\n"                    # no auth -> flagged
+    )
+    hits, _ = _sast_full_scan(sast, src)
+    noauth = [c for _, c in hits.get("noauth", [])]
+    assert not any("/items" in c for c in noauth)
+    assert not any("/w/{id}" in c for c in noauth)
+    assert any("/open" in c for c in noauth)
+
+
+def test_cookie_session_login_detection():
+    """A login cookie set on a 302 (in the session jar after the redirect) is
+    detected as the credential, auth_kind flips to cookie, and the jar is cleared
+    so it doesn't pollute unauthenticated probes."""
+    import requests
+
+    from heimdall.bootstrap.principals import _session_cookie
+    from heimdall.core.model import AppProfile
+
+    class _R:
+        cookies = requests.cookies.RequestsCookieJar()
+        history: list = []
+
+    class _H:
+        s = requests.Session()
+
+    h = _H()
+    h.s.cookies.set("fastapi_auth", "abc123")     # landed in the jar after the 302
+    p = AppProfile(base_url="http://x")
+    val = _session_cookie(p, _R(), h)
+    assert val == "abc123"
+    assert p.auth.auth_kind == "cookie"
+    assert p.auth.credential_name == "fastapi_auth"
+    assert len(h.s.cookies) == 0                    # jar cleared
+
+
 def test_sast_auth_middleware_guards_routes(tmp_path):
     """An app-wide authentication middleware guards every route (routes read
     request.state.user, no Depends) — no-auth must not fire. Without it, the same

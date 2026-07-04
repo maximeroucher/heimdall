@@ -491,6 +491,38 @@ def _resolve_auth_controllers(parsed: list) -> set:
     return auth
 
 
+# Decorator-based auth (Flask-Login `@login_required`, Starlette `@requires(...)`,
+# `@roles_required("admin")`, ...) stacked on a route handler — a whole auth idiom
+# SAST otherwise misses (it inspects the signature, not sibling decorators).
+_AUTH_DECORATORS = frozenset({
+    "login_required", "requires_auth", "require_auth", "auth_required",
+    "authenticated", "roles_required", "role_required", "permission_required",
+    "permissions_required", "jwt_required", "token_required", "protected",
+    "requires", "require_login", "require_user", "require_scope", "require_role",
+    "scope_required", "admin_required", "authorize", "authenticate",
+})
+
+
+def _handler_has_auth_decorator(fn: ast.AST) -> bool:
+    for dec in getattr(fn, "decorator_list", []):
+        if isinstance(dec, ast.Name):
+            name = dec.id
+        elif isinstance(dec, ast.Attribute):
+            name = dec.attr
+        elif isinstance(dec, ast.Call):
+            f = dec.func
+            name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
+        else:
+            name = ""
+        # the route decorator itself (@router.post etc.) is a Call on get/post/...
+        if name in ("get", "post", "put", "patch", "delete", "head", "route",
+                    "websocket", "api_route"):
+            continue
+        if name and (name.lower() in _AUTH_DECORATORS or _auth_ish(name)):
+            return True
+    return False
+
+
 def _decorator_router_var(dec: ast.AST) -> str | None:
     """The router variable a route decorator hangs off: ``@router.post`` -> 'router'."""
     if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute):
@@ -729,7 +761,8 @@ def _scan_file(path: str, rel: str, lines: list[str], graph: dict) -> None:
                     router_authed = rvar is not None and (module_key, rvar) in protected
                     cbv_authed = enclosing_class(node) in auth_controllers
                     if not (_handler_has_auth(node, aliases) or _decorator_deps_auth(dec)
-                            or router_authed or sig_authed or cbv_authed or app_auth_mw) and not public:
+                            or router_authed or sig_authed or cbv_authed or app_auth_mw
+                            or _handler_has_auth_decorator(node)) and not public:
                         sinks.append({"kind": "noauth", "loc": f"{rel}:{node.lineno}",
                                       "code": f"{route[0].upper()} {route[1]}  ({node.name})",
                                       "func": node.name, "route": route})
