@@ -33,6 +33,13 @@ _PUBLIC_EXACT = frozenset({
 })
 
 
+# A structurally-plausible but cryptographically-invalid bearer token. An
+# auth-enforcing route (required OR optional) rejects it (401/403); a route that
+# ignores auth entirely accepts it — the tell that distinguishes optional-auth
+# (validates when present) from a genuinely unenforced "secured" route.
+_GARBAGE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJoZWltZGFsbC1nYXJiYWdlIn0.not-a-valid-signature"
+
+
 def _is_public_by_design(path: str, oid: str) -> bool:
     if path in _PUBLIC_EXACT:
         return True
@@ -61,12 +68,29 @@ def _unauth_enforcement(ctx: Context) -> None:
     secured_get = [r for r in ctx.routes.secured()
                    if r.method == "GET" and not r.has_path_param]
     broken = []
+    optional_auth = 0
     for r in secured_get:
         if _is_public_by_design(r.path, r.operation_id):
             continue
         resp = ctx.get(r.path)  # no token
-        if resp.status_code < 300:
-            broken.append((r, resp))
+        if resp.status_code >= 300:
+            continue
+        # 2xx without a token. This is only an auth-ENFORCEMENT failure if the
+        # route does no credential check at all. OPTIONAL-auth routes (very common:
+        # a public feed that adds "following"/"favorited" flags when logged in)
+        # also 2xx without a token — and FastAPI emits an IDENTICAL OpenAPI security
+        # block for optional and required deps, so the spec can't tell them apart.
+        # Distinguish behaviourally: an optional-auth route still VALIDATES a token
+        # when one is present, so a GARBAGE token is rejected (401/403); a genuinely
+        # unprotected route ignores auth entirely and 2xxs the garbage token too.
+        garbage = ctx.get(r.path, token=_GARBAGE_TOKEN)
+        if garbage.status_code in (401, 403):
+            optional_auth += 1
+            continue                       # optional auth by design — not a bypass
+        broken.append((r, resp))
+    if optional_auth:
+        ctx.note(f"a01: {optional_auth} secured GET route(s) served an anonymous caller but "
+                 "rejected a garbage token — optional authentication by design, not a bypass")
     if broken:
         sample = "\n".join(f"  GET {r.path} -> {resp.status_code}" for r, resp in broken[:15])
         ctx.finding(

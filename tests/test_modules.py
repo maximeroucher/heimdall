@@ -222,6 +222,34 @@ def test_open_redirect_matches_effective_nav_host_not_substring():
     assert not hit(Resp(200, body=f"<p>never visit {C}</p>"))          # mention, no redirect
 
 
+def test_data_exposure_own_token_skipped_cross_user_flagged():
+    """A JWT echoed on a /me or token-refresh response that carries the CALLER's
+    own identity is not a leak; another user's token (or a token when we hold no
+    caller token) still flags. The generic sub='access' marker must not be
+    mistaken for a shared identity."""
+    import base64
+    import json as _json
+    from heimdall.modules import data_exposure as de
+
+    def jwt(claims):
+        b = lambda o: base64.urlsafe_b64encode(_json.dumps(o).encode()).rstrip(b"=").decode()
+        return f"{b({'alg':'HS256','typ':'JWT'})}.{b(claims)}.sig"
+
+    caller = jwt({"username": "alice", "exp": 1, "sub": "access"})
+    same = jwt({"username": "alice", "exp": 999, "sub": "access"})   # refreshed, same user
+    other = jwt({"username": "bob", "exp": 1, "sub": "access"})       # different user
+
+    assert de._is_own_token(same, caller)        # caller's own token, refreshed → skip
+    assert de._is_own_token(caller, caller)      # identical string → skip
+    assert not de._is_own_token(other, caller)   # another user's token → still a leak
+    assert not de._is_own_token(same, None)      # no caller token → cannot vouch → flag
+    assert not de._is_own_token("not-a-jwt", caller)
+    # sub='access' alone (no identity claim) must NOT count as same identity
+    a = jwt({"sub": "access", "exp": 1})
+    b = jwt({"sub": "access", "exp": 2})
+    assert not de._is_own_token(a, b)
+
+
 def test_data_exposure_iban_spaces_and_base64_magic():
     """Space-formatted IBANs are caught (checksum-validated on a stripped copy);
     base64 file/image data (magic prefix) is not a secret."""

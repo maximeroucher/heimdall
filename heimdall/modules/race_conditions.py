@@ -60,6 +60,7 @@ def run(ctx: Context) -> None:
         candidates = candidates[:_MAX_ENDPOINTS]
 
     raced = []
+    idempotent = []    # ≥2 concurrent successes but all returned IDENTICAL responses
     limited = 0        # endpoints whose sequential-repeat proved a once/limited invariant
     reachable = 0
     for r in candidates:
@@ -71,29 +72,53 @@ def run(ctx: Context) -> None:
         if result is None:
             continue                       # never succeeded -> unreachable / gated
         reachable += 1
-        conc_ok, seq_ok = result
+        conc_ok, seq_ok, distinct = result
         # The invariant is "limited/once" iff the resource is now consumed: a
         # sequential repeat is rejected. Idempotent / unlimited ops (seq still
         # succeeds) simply aren't race targets. This is the whole classifier.
         if seq_ok > 0:
             continue
         limited += 1
-        if conc_ok >= 2:
+        if conc_ok < 2:
+            continue
+        # ≥2 concurrent successes. But "2xx count" alone over-reports: an
+        # idempotent toggle (favorite / like / follow, or any INSERT ... ON
+        # CONFLICT DO NOTHING) lets N concurrent requests all return 2xx while the
+        # persisted invariant stays at ONE application — no double-spend. Those
+        # duplicate successes read the same pre-state and return BYTE-IDENTICAL
+        # responses. A genuine cumulative race (distinct rows created, a balance
+        # debited N times, a counter advanced) instead yields DIVERGENT responses.
+        # So require response divergence to confirm real over-application.
+        if distinct >= 2:
             raced.append((r, conc_ok))
+        else:
+            idempotent.append((r, conc_ok))
+
+    if idempotent:
+        ctx.note("race: "
+                 + "; ".join(f"{r.method} {r.path} ({n}/{_BURST} concurrent 2xx but "
+                             "identical responses)" for r, n in idempotent[:8])
+                 + " — duplicate successes returned identical responses, consistent with an "
+                 "idempotent no-op (favorite/like/follow, INSERT..ON CONFLICT) rather than a "
+                 "cumulative race; not flagged. Verify the persisted invariant if any is a "
+                 "hidden accumulator.")
 
     if raced:
-        sample = "\n".join(f"  {r.method} {r.path}: {n}/{_BURST} concurrent succeeded, "
-                           f"then sequential repeats rejected" for r, n in raced[:15])
+        sample = "\n".join(f"  {r.method} {r.path}: {n}/{_BURST} concurrent succeeded with "
+                           f"DIVERGING responses, then sequential repeats rejected"
+                           for r, n in raced[:15])
         ctx.finding(
             id="a04-race-toctou", owasp="A04", severity="HIGH",
             title=f"Race condition (TOCTOU) on {len(raced)} limited operation(s)",
             summary=(
                 "These endpoints enforce a limited/once invariant (a sequential repeat is "
                 "rejected) but a burst of simultaneous identical requests succeeded MORE THAN "
-                "ONCE — the check-then-act guard isn't atomic. Depending on the endpoint this "
-                "enables double-spend, multiple redemptions of a one-time code, quota/limit "
-                "bypass, or duplicate votes. Use atomic DB operations / row locks / unique "
-                "constraints, not read-then-write."
+                "ONCE AND the successes returned DIVERGING responses — the check-then-act guard "
+                "isn't atomic and the duplicate successes reflect distinct cumulative effects "
+                "(not idempotent no-ops). Depending on the endpoint this enables double-spend, "
+                "multiple redemptions of a one-time code, quota/limit bypass, or duplicate "
+                "votes. Use atomic DB operations / row locks / unique constraints, not "
+                "read-then-write."
             ),
             evidence=sample,
             route=f"{raced[0][0].method} {raced[0][0].path}",
@@ -111,7 +136,8 @@ def run(ctx: Context) -> None:
             title="Limited operations resist concurrent duplication",
             summary=f"Of {reachable} reachable mutating endpoint(s), {limited} enforced a "
                     "once/limited invariant (sequential repeat rejected); a concurrent burst "
-                    "of each still yielded a single success — the guards look atomic.",
+                    "of each either yielded a single success or only idempotent duplicate "
+                    "successes (identical responses) — the guards look atomic.",
         )
     else:
         ctx.note(f"raced {reachable} reachable mutating endpoint(s); none exposed a "
@@ -119,22 +145,28 @@ def run(ctx: Context) -> None:
 
 
 def _probe(ctx: Context, method: str, path: str, token: str | None, body: dict):
-    """Return (concurrent_successes, sequential_successes_after) or None to skip.
+    """Return (concurrent_successes, sequential_successes_after, distinct_bodies)
+    or None to skip.
 
-    Skips endpoints where even a single call doesn't clearly succeed (a body we
-    couldn't synthesise validly), so we don't misread validation errors as races.
+    ``distinct_bodies`` is the number of DISTINCT response bodies among the
+    concurrent successes — 1 means every duplicate success returned the same
+    thing (idempotent no-op), ≥2 means the successes reflect diverging state (a
+    real cumulative race). Skips endpoints where even a single call doesn't
+    clearly succeed (a body we couldn't synthesise validly), so we don't misread
+    validation errors as races.
     """
     base = ctx.base_url
     kind = ctx.auth.auth_kind
     name = ctx.auth.credential_name
 
-    def fire() -> int:
+    def fire() -> tuple[int, str]:
         cli = HttpClient(base, scheme=ctx.auth.header_scheme, auth_kind=kind,
                          credential_name=name, timeout=15)
         try:
-            return cli.req(method, path, token=token, json=body, retry_429=False).status_code
+            r = cli.req(method, path, token=token, json=body, retry_429=False)
+            return r.status_code, (r.text or "")
         except Exception:  # noqa: BLE001
-            return 0
+            return 0, ""
 
     # Barrier-aligned concurrent burst.
     barrier = threading.Barrier(_BURST)
@@ -148,16 +180,18 @@ def _probe(ctx: Context, method: str, path: str, token: str | None, body: dict):
 
     try:
         with ThreadPoolExecutor(max_workers=_BURST) as ex:
-            statuses = list(ex.map(worker, range(_BURST)))
+            results = list(ex.map(worker, range(_BURST)))
     except Exception as exc:  # noqa: BLE001
         ctx.note(f"race burst on {method} {path} failed: {exc}")
         return None
-    conc_ok = sum(1 for s in statuses if 200 <= s < 300)
+    ok_bodies = [b for s, b in results if 200 <= s < 300]
+    conc_ok = len(ok_bodies)
     if conc_ok == 0:
         return None  # never succeeded (needs a real body / not reachable) — skip
+    distinct = len({b.strip() for b in ok_bodies})
     # Sequential repeats: is the operation now consumed / rejected?
     seq_ok = 0
     for _ in range(3):
-        if 200 <= fire() < 300:
+        if 200 <= fire()[0] < 300:
             seq_ok += 1
-    return conc_ok, seq_ok
+    return conc_ok, seq_ok, distinct

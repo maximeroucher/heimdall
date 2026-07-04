@@ -130,6 +130,40 @@ def _is_auth_route(route) -> bool:
     return any(h in hay for h in _AUTH_HINTS)
 
 
+# Claims that identify WHO a token belongs to. `sub` is included only when it
+# isn't one of these generic token-TYPE markers (RealWorld sets sub="access").
+_IDENTITY_CLAIMS = ("username", "preferred_username", "email", "user_id",
+                    "uid", "userid", "name", "nickname", "login")
+_GENERIC_SUB = frozenset({"access", "refresh", "id_token", "auth", "bearer", "token"})
+
+
+def _is_own_token(value, actor_token) -> bool:
+    """True if ``value`` is a JWT carrying the SAME identity as the caller's own
+    token — the caller's credential echoed back on a "get current user" / token-
+    refresh endpoint (e.g. RealWorld's GET /api/user, or any /users/me that
+    returns ``token``), which is by design, not a leak. Another user's token
+    (different identity) is NOT own, so a genuine cross-user token leak still
+    flags. Requires the response to have been fetched with the caller's token."""
+    if not actor_token:
+        return False
+    sval = str(value)
+    if sval == actor_token:
+        return True
+    from ..discovery.auth import decode_jwt
+    a, b = decode_jwt(sval), decode_jwt(actor_token)
+    if not a or not b:
+        return False
+    ac, bc = a[1], b[1]
+    for claim in _IDENTITY_CLAIMS:
+        av = ac.get(claim)
+        if av and av == bc.get(claim):
+            return True
+    asub = str(ac.get("sub", ""))
+    if asub and asub == str(bc.get("sub", "")) and asub.lower() not in _GENERIC_SUB:
+        return True
+    return False
+
+
 def _inspect(ctx: Context, route, token, hits: list[dict], known_pw: set) -> None:
     path = route.fill_path({p: "1" for p in route.path_params})
     try:
@@ -147,6 +181,8 @@ def _inspect(ctx: Context, route, token, hits: list[dict], known_pw: set) -> Non
     for keypath, key, value in _walk(data):
         res = _sensitive(key, value, auth_route, known_pw)
         if res:
+            if _is_own_token(value, token):
+                continue     # caller's own token echoed on a /me / refresh response
             reason, severity = res
             hits.append({"route": route, "keypath": keypath, "key": key,
                          "reason": reason, "severity": severity,
