@@ -419,6 +419,71 @@ def test_sast_skips_developer_tooling_dirs(tmp_path):
     assert scanned == {"app/main.py"}, scanned
 
 
+def _run_a07_bruteforce(*, per_account_throttle: bool):
+    """Drive a07 `_brute_force` against a stateful fake login: a per-IP limiter
+    (5/min, keyed on X-Forwarded-For when present) plus an OPTIONAL per-account
+    throttle (10 failures, IP-independent, also 429 — the Ymir hardening shape).
+    Returns the findings the module emitted."""
+    from types import SimpleNamespace
+
+    from heimdall.modules import a07_auth
+
+    class Resp:
+        def __init__(self, code):
+            self.status_code = code
+            self.text = ""
+
+    ip_hits: dict[str, int] = {}
+    account_fails = {"n": 0}
+    findings = []
+
+    class FakeCtx:
+        base_url = "http://t"
+        auth = SimpleNamespace(login_path="/login", username_field="username",
+                               password_field="password", login_style="json",
+                               login_wrapper=None)
+        profile = SimpleNamespace(any_authed=lambda: None)
+
+        def principal(self, *roles):
+            return SimpleNamespace(email="attacker@t.io")
+
+        def post(self, path, *, data=None, json=None, headers=None, retry_429=False):
+            ip = (headers or {}).get("X-Forwarded-For", "127.0.0.1")
+            ip_hits[ip] = ip_hits.get(ip, 0) + 1
+            if ip_hits[ip] > 5:                         # per-IP limiter (spoofable)
+                return Resp(429)
+            if per_account_throttle and account_fails["n"] >= 10:
+                return Resp(429)                        # IP-independent backstop
+            account_fails["n"] += 1
+            return Resp(401)                            # wrong password
+
+        def finding(self, **kw):
+            findings.append(kw)
+
+        def note(self, *a, **k):
+            pass
+
+    a07_auth._brute_force(FakeCtx())
+    return findings
+
+
+def test_a07_xff_bypass_medium_when_per_account_throttle_backstops():
+    """A per-IP limiter that XFF-rotation resets is only MEDIUM when a fresh unique
+    IP still gets throttled (proof of an IP-independent per-account backstop) —
+    single-account brute force is bounded; only spraying remains."""
+    findings = _run_a07_bruteforce(per_account_throttle=True)
+    xff = [f for f in findings if f["id"] == "a07-rate-limit-xff-bypass"]
+    assert xff and xff[0]["severity"] == "MEDIUM"
+    assert "spray" in xff[0]["summary"].lower()
+
+
+def test_a07_xff_bypass_high_when_no_backstop():
+    """No IP-independent throttle → rotating XFF gives unbounded brute force = HIGH."""
+    findings = _run_a07_bruteforce(per_account_throttle=False)
+    xff = [f for f in findings if f["id"] == "a07-rate-limit-xff-bypass"]
+    assert xff and xff[0]["severity"] == "HIGH"
+
+
 def test_a07_recognizes_lockout_and_rate_limit_status_codes():
     """Brute-force protection is signalled by 429 (IP/global rate limit) AND 423
     (per-account lockout — the common FastAPI defence). Recognising only 429 would

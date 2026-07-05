@@ -184,43 +184,83 @@ def _brute_force(ctx: Context) -> None:
         return
     try:
         evaded = []
+        still_throttled = 0        # fresh, unique IPs that STILL got throttled
         for i in range(1, 21):
             xff = f"10.0.0.{i}"
             resp = _login_attempt(ctx, ident, f"xff-pw-{i}",
                                   headers={"X-Forwarded-For": xff})
-            if resp.status_code != trip_code:
+            if resp.status_code == trip_code:
+                # A never-before-seen source IP still hit the throttle. A per-IP
+                # limiter can't throttle a fresh IP on its first request — so this
+                # response comes from an IP-INDEPENDENT throttle (per-account or
+                # global), the spoofing-proof backstop.
+                still_throttled += 1
+            else:
                 evaded.append((xff, resp.status_code))
     except Exception as e:  # noqa: BLE001
         ctx.note(f"X-Forwarded-For bypass probe errored: {e}")
         return
 
-    # If a healthy majority of spoofed-IP requests dodge the 429, the limiter is
-    # trusting an attacker-controlled header.
-    if len(evaded) >= 5:
-        sample = ", ".join(f"{ip}->{code}" for ip, code in evaded[:8])
-        ctx.finding(
-            id="a07-rate-limit-xff-bypass",
-            owasp="A07", severity="HIGH",
-            title="Login rate limit keyed on spoofable X-Forwarded-For",
-            summary=(
-                "After the limiter engaged, rotating the X-Forwarded-For header let requests "
-                "sail past the 429. Rate limiting bucketed on a client-supplied header can be "
-                "reset at will by an attacker, nullifying brute-force protection. Key throttles "
-                "on the real transport peer (or a trusted proxy hop count), not raw XFF."
-            ),
-            evidence=f"{len(evaded)}/20 spoofed-IP logins evaded the 429: {sample}",
-            reproduction="Trigger the 429, then replay the same login while incrementing "
-                         "the X-Forwarded-For header (10.0.0.1, 10.0.0.2, …).",
-            references=[REFS["A07"], REFS["cheat-authz"]],
-            tools=["Burp (Intruder + X-Forwarded-For)", "curl -H 'X-Forwarded-For: 10.0.0.1'"],
-        )
-    else:
+    if len(evaded) < 5:
         ctx.finding(
             id="a07-rate-limit-xff-bypass",
             owasp="A07", severity="SAFE",
             title="Login rate limit resists X-Forwarded-For spoofing",
             summary="Rotating the X-Forwarded-For header did not evade the 429; the limiter "
                     "is not keyed on that client-supplied header.",
+        )
+        return
+
+    # The per-IP limiter WAS reset by rotating XFF. Severity turns on whether a
+    # spoofing-proof backstop exists: if fresh unique IPs kept getting throttled
+    # (`still_throttled`), an IP-independent per-account throttle bounds
+    # single-account brute force — the residual risk is credential SPRAYING (a few
+    # guesses each across many accounts), which no per-account counter catches, not
+    # unlimited brute force. No such backstop → unlimited brute force of any one
+    # account = HIGH.
+    sample = ", ".join(f"{ip}->{code}" for ip, code in evaded[:8])
+    if still_throttled >= 3:
+        ctx.finding(
+            id="a07-rate-limit-xff-bypass",
+            owasp="A07", severity="MEDIUM",
+            title="Per-IP login limiter is X-Forwarded-For-spoofable (per-account throttle backstops it)",
+            summary=(
+                "Rotating the X-Forwarded-For header reset the per-IP login limiter — it "
+                "trusts a client-supplied header. A spoofing-proof throttle still engaged "
+                "for the targeted account across fresh IPs, so single-account brute force "
+                "stays bounded; but credential SPRAYING (one or two guesses each across "
+                "many accounts) evades both the spoofable per-IP limit and the per-account "
+                "counter. Key the per-IP throttle on the real transport peer / a trusted "
+                "proxy hop (pin uvicorn's forwarded_allow_ips), not raw XFF."
+            ),
+            evidence=(f"{len(evaded)}/20 spoofed-IP logins evaded the per-IP {trip_code} before "
+                      f"an IP-independent throttle re-engaged ({still_throttled}/20 fresh IPs "
+                      f"still {trip_code}): {sample}"),
+            reproduction="Trigger the per-IP limit, rotate X-Forwarded-For (10.0.0.1, 10.0.0.2, "
+                         "…) to reset it; note a per-account throttle eventually re-blocks the "
+                         "same account, but spraying across accounts is not bounded.",
+            references=[REFS["A07"], REFS["cheat-authz"]],
+            tools=["Burp (Intruder + X-Forwarded-For)", "curl -H 'X-Forwarded-For: 10.0.0.1'"],
+        )
+    else:
+        ctx.finding(
+            id="a07-rate-limit-xff-bypass",
+            owasp="A07", severity="HIGH",
+            title="Login rate limit keyed on spoofable X-Forwarded-For",
+            summary=(
+                "After the limiter engaged, rotating the X-Forwarded-For header let requests "
+                "sail past the 429 with no other throttle re-engaging. Rate limiting bucketed "
+                "on a client-supplied header can be reset at will, nullifying brute-force "
+                "protection entirely — any single account can be brute-forced without bound. "
+                "Key throttles on the real transport peer (or a trusted proxy hop count), not "
+                "raw XFF, and add a per-account throttle as a backstop."
+            ),
+            evidence=f"{len(evaded)}/20 spoofed-IP logins evaded the {trip_code} "
+                     f"(no IP-independent throttle re-engaged): {sample}",
+            reproduction="Trigger the 429, then replay the same login while incrementing "
+                         "the X-Forwarded-For header (10.0.0.1, 10.0.0.2, …).",
+            references=[REFS["A07"], REFS["cheat-authz"]],
+            tools=["Burp (Intruder + X-Forwarded-For)", "curl -H 'X-Forwarded-For: 10.0.0.1'"],
         )
 
 
